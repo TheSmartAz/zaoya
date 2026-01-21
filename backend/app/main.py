@@ -50,7 +50,7 @@ async def restrict_pages_host(request, call_next):
 # CORS middleware (configure properly for production)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.cors_origins.split(",") if settings.cors_origins != "*" else ["*"],
+    allow_origins=settings.cors_origins if isinstance(settings.cors_origins, list) else ["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -77,6 +77,8 @@ from app.api.pages import router as pages_router
 from app.api.static import router as static_router
 from app.api.submissions import router as submissions_router
 from app.api.analytics import router as analytics_router
+from app.api.draft import router as draft_router
+from app.api.snapshots import router as snapshots_router
 
 app.include_router(chat_router)
 app.include_router(interview_router)
@@ -85,6 +87,8 @@ app.include_router(auth_router, prefix="/api")
 app.include_router(projects_router, prefix="/api")
 app.include_router(submissions_router, prefix="/api")
 app.include_router(analytics_router, prefix="/api")
+app.include_router(draft_router)
+app.include_router(snapshots_router)
 app.include_router(pages_router)  # Published pages (no /api prefix)
 app.include_router(static_router)  # Static files
 
