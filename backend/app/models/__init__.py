@@ -2,6 +2,9 @@
 from pydantic import BaseModel
 from typing import List, Optional, Dict
 
+# ORM models (keep separate from Pydantic models)
+from app.models.db import Base, User, Project, Snapshot, Page
+
 
 class Message(BaseModel):
     """Chat message"""
