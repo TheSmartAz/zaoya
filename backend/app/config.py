@@ -5,6 +5,7 @@ All sensitive values should be loaded from environment variables.
 
 from pydantic_settings import BaseSettings
 from typing import Optional
+from pydantic import field_validator
 
 
 class Settings(BaseSettings):
@@ -20,8 +21,9 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8000
 
-    # Database (for production - SQLAlchemy)
-    database_url: Optional[str] = None
+    # Database (PostgreSQL with SQLAlchemy)
+    database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/zaoya"
+    database_url_sync: str = "postgresql://postgres:postgres@localhost:5432/zaoya"
 
     # Security
     secret_key: str = "change-me-in-production"  # JWT secret
@@ -51,6 +53,13 @@ class Settings(BaseSettings):
 
     # Published Pages URL
     pages_url: str = "http://localhost:8000"  # Base URL for published pages
+
+    @field_validator("cors_origins", mode="before")
+    @classmethod
+    def parse_cors_origins(cls, v):
+        if isinstance(v, str):
+            return [origin.strip() for origin in v.split(",")]
+        return v
 
     class Config:
         env_file = ".env"
