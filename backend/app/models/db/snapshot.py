@@ -1,10 +1,10 @@
 """Snapshot ORM model."""
 
 from datetime import datetime
-from sqlalchemy import Column, String, TEXT, ForeignKey, Boolean, ExcludeConstraint
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy import Column, String, TEXT, ForeignKey, Boolean
+from sqlalchemy.dialects.postgresql import JSONB, UUID, ExcludeConstraint
 from sqlalchemy.orm import Mapped, mapped_column
-from uuid import UUID
+from uuid import uuid4 as uuid_generator
 
 from app.db import Base
 
@@ -14,8 +14,8 @@ class Snapshot(Base):
 
     __tablename__ = "snapshots"
 
-    id: Mapped[UUID] = mapped_column(primary_key=True)
-    project_id: Mapped[UUID] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
+    id: Mapped[UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid_generator)
+    project_id: Mapped[UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
     version_number: Mapped[int] = mapped_column(nullable=False)
     summary: Mapped[str | None] = mapped_column(TEXT)
     design_system: Mapped[dict] = mapped_column(JSONB, default=dict)

@@ -4,7 +4,7 @@ All sensitive values should be loaded from environment variables.
 """
 
 from pydantic_settings import BaseSettings
-from typing import Optional
+from typing import Optional, List
 from pydantic import field_validator
 
 
@@ -22,8 +22,8 @@ class Settings(BaseSettings):
     port: int = 8000
 
     # Database (PostgreSQL with SQLAlchemy)
-    database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/zaoya"
-    database_url_sync: str = "postgresql://postgres:postgres@localhost:5432/zaoya"
+    database_url: str = "postgresql+asyncpg://thesmartaz@localhost:5432/zaoya"
+    database_url_sync: str = "postgresql://thesmartaz@localhost:5432/zaoya"
 
     # Security
     secret_key: str = "change-me-in-production"  # JWT secret
@@ -31,7 +31,7 @@ class Settings(BaseSettings):
     refresh_token_expire_days: int = 30
 
     # CORS (adjust for production)
-    cors_origins: str = "*"  # Comma-separated list
+    cors_origins: List[str] = ["*"]  # List of allowed origins
 
     # Rate Limiting
     rate_limit_per_minute: int = 100
