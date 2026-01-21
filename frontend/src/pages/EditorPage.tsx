@@ -11,6 +11,7 @@ import { PreviewPanel } from '@/components/preview/PreviewPanel';
 import { PhoneFrame } from '@/components/preview/PhoneFrame';
 import { VersionHistoryPanel } from '@/components/version/VersionHistoryPanel';
 import { PublishButton } from '@/components/editor/PublishButton';
+import { ProjectSidebar } from '@/components/editor/ProjectSidebar';
 import { Template } from '@/types/template';
 import { templates } from '@/data/templates';
 import { extractCode } from '@/utils/codeExtractor';
@@ -30,11 +31,21 @@ export function EditorPage() {
   const versions = useVersionStore((s) => s.versions);
   const currentVersionId = useVersionStore((s) => s.currentVersionId);
 
+  // Multi-page state
+  const [selectedPageId, setSelectedPageId] = useState<string | null>(null);
+  const [showAddPage, setShowAddPage] = useState(false);
+  const [showDesign, setShowDesign] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+
   const [template, setTemplate] = useState<Template | null>(null);
   const [templateInputs, setTemplateInputs] = useState<Record<string, string>>({});
   const [showVersionHistory, setShowVersionHistory] = useState(false);
   const [lastProcessedMessageId, setLastProcessedMessageId] = useState<string | null>(null);
   const [lastValidationErrorId, setLastValidationErrorId] = useState<string | null>(null);
+
+  // Check if this is a multi-page project (has pages in the store)
+  const { pages } = useProjectStore();
+  const isMultiPage = pages.length > 0;
 
   const hasGenerated = versions.length > 0;
   const currentVersion = useMemo(
@@ -144,6 +155,71 @@ export function EditorPage() {
     navigate('/create');
   };
 
+  // If multi-page project, show 3-panel layout
+  if (isMultiPage) {
+    return (
+      <div className="flex h-screen">
+        {/* Left sidebar - Pages */}
+        <ProjectSidebar
+          projectId={projectId!}
+          selectedPageId={selectedPageId}
+          onPageSelect={setSelectedPageId}
+          onAddPage={() => setShowAddPage(true)}
+          onOpenDesign={() => setShowDesign(true)}
+          onOpenSettings={() => setShowSettings(true)}
+        />
+
+        {/* Middle - Preview */}
+        <div className="flex-1 flex items-center justify-center bg-gray-100">
+          <div className="relative">
+            {/* Header actions */}
+            <div className="absolute -top-12 left-0 right-0 flex items-center justify-between">
+              <button
+                onClick={handleBack}
+                className="flex items-center gap-2 text-gray-600 hover:text-gray-800 transition-colors"
+              >
+                <ArrowLeft size={20} />
+                <span>Back</span>
+              </button>
+
+              <div className="flex items-center gap-3">
+                {projectId && <PublishButton projectId={projectId} />}
+                <button
+                  onClick={() => setShowVersionHistory(!showVersionHistory)}
+                  className={`flex items-center gap-2 px-3 py-1.5 rounded-lg transition-colors ${
+                    showVersionHistory
+                      ? 'bg-blue-100 text-blue-700'
+                      : 'text-gray-600 hover:bg-gray-100'
+                  }`}
+                >
+                  <HistoryIcon size={18} />
+                  <span>History</span>
+                </button>
+              </div>
+            </div>
+
+            <PhoneFrame>
+              <PreviewPanel
+                html={selectedPageId ? pages.find(p => p.id === selectedPageId)?.html || '' : (currentVersion?.html || '')}
+                js={selectedPageId ? pages.find(p => p.id === selectedPageId)?.js || null : (currentVersion?.js || null)}
+              />
+            </PhoneFrame>
+          </div>
+        </div>
+
+        {/* Bottom - Chat (collapsible) */}
+        <div className="w-96 border-l border-gray-200">
+          <ChatPanel
+            template={template}
+            templateInputs={templateInputs}
+            hasGenerated={hasGenerated}
+          />
+        </div>
+      </div>
+    );
+  }
+
+  // Original single-page layout
   return (
     <div className="flex h-screen">
       {/* Left panel - Chat or Version History */}
