@@ -2,30 +2,71 @@
 
 > **Version**: v1 Phase 3
 > **Created**: 2025-01-22
-> **Status**: Draft
+> **Updated**: 2025-01-22
+> **Status**: Draft (Revised)
 > **Complexity**: Medium-Large
+
+---
+
+## Architecture Decision Record
+
+### Decision: Edge + SSL Architecture
+
+| Component | Decision |
+|-----------|----------|
+| **Edge Server** | Caddy on dedicated Aliyun ECS |
+| **SSL Certificates** | Let's Encrypt via Caddy on-demand TLS |
+| **Backend** | FastAPI validates domains + serves pages |
+| **Certificate Storage** | Local Caddy storage (v1); shared storage for HA (v2+) |
+
+**Rationale**: Self-hosted Caddy provides free SSL via Let's Encrypt, works well in China, and requires no external service dependency. On-demand TLS means certificates are provisioned automatically on first request after domain verification.
 
 ---
 
 ## Overview
 
-Enable Zaoya users to connect custom domains to their published pages. Users can publish their pages on their own domain (e.g., `example.com`) instead of the default `zaoya.app/p/{id}` URL.
+Enable Zaoya users to connect custom domains to their published pages. Users can publish their pages on their own domain (e.g., `example.com` or `www.example.com`) instead of the default `zaoya.app/p/{id}` URL.
 
 ### Goals
 
-1. Users can add a custom domain to their project
-2. DNS verification ensures domain ownership
+1. Users can add one custom domain to their project (1:1 mapping)
+2. DNS verification ensures domain ownership via TXT record
 3. SSL certificates are automatically provisioned (free via Let's Encrypt)
 4. Published pages are served on custom domains with HTTPS
-5. Zero ongoing cost for SSL certificates
+5. Deterministic www redirect behavior (no per-user configuration)
 
 ### Non-Goals (v1)
 
-- Multiple domains per project (1:1 mapping only)
-- www/non-www redirect configuration
+- Multiple domains per project (strict 1:1 mapping)
+- Per-user www/non-www redirect configuration (deterministic default only)
 - Subdomain wildcards (`*.example.com`)
 - Domain transfer between projects
 - Custom SSL certificate upload
+- Punycode/IDN domain support (ASCII only for v1)
+
+### Canonical URL Policy (v1)
+
+**Deterministic behavior with no user configuration:**
+
+| User Configures | Canonical URL | Redirect Behavior |
+|-----------------|---------------|-------------------|
+| Apex domain (`example.com`) | `https://example.com` | `www.example.com` → 301 → `example.com` |
+| Subdomain (`www.example.com`) | `https://www.example.com` | No automatic redirect |
+| Other subdomain (`blog.example.com`) | `https://blog.example.com` | No automatic redirect |
+
+This keeps implementation simple while providing sensible defaults.
+
+### Plan Limits
+
+**Domain limits follow project limits (not separate entitlement):**
+
+| Plan | Project Limit | Custom Domains |
+|------|---------------|----------------|
+| Pro | 1 project | 1 domain (implicit) |
+| Team | 3 projects | 3 domains (implicit) |
+| Business | 10 projects | 10 domains (implicit) |
+
+Each project may have **at most one custom domain**. Enforced via `UNIQUE(project_id)` constraint.
 
 ---
 
@@ -51,19 +92,20 @@ Enable Zaoya users to connect custom domains to their published pages. Users can
 │   │  • On-demand SSL via         │                                         │
 │   │    Let's Encrypt             │                                         │
 │   │  • Validates domain with     │                                         │
-│   │    backend before issuing    │                                         │
-│   │    certificate               │                                         │
+│   │    backend (+ shared secret) │                                         │
 │   │  • Proxies to backend        │                                         │
+│   │  • Handles www→apex redirect │                                         │
 │   └──────────────┬───────────────┘                                         │
 │                  │                                                          │
-│                  │ 1. Ask: Is this domain valid?                            │
-│                  │ 2. Proxy request with X-Custom-Domain header             │
+│                  │ 1. Ask: Is this domain valid? (with X-Zaoya-Edge-Secret) │
+│                  │ 2. Proxy request with X-Custom-Domain + secret header   │
 │                  ▼                                                          │
 │   ┌──────────────────────────────┐      ┌────────────────────────────┐    │
 │   │      Zaoya Backend           │      │       PostgreSQL           │    │
 │   │      (FastAPI)               │      │                            │    │
 │   │                              │◄────►│  • custom_domains table    │    │
 │   │  • /api/internal/domain/check│      │  • projects table          │    │
+│   │  • Validates edge secret     │      │  • audit_events table      │    │
 │   │  • Custom domain middleware  │      │  • pages/snapshots         │    │
 │   │  • Serves published HTML     │      │                            │    │
 │   └──────────────────────────────┘      └────────────────────────────┘    │
@@ -71,34 +113,30 @@ Enable Zaoya users to connect custom domains to their published pages. Users can
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Domain Configuration Flow
+### DNS Setup Options
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                         Domain Setup Flow                                   │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  1. User adds domain in Zaoya UI                                            │
-│     └─► Backend generates verification token                                │
-│     └─► Returns DNS instructions                                            │
-│                                                                             │
-│  2. User configures DNS at registrar                                        │
-│     └─► TXT record: _zaoya-verify.example.com = zaoya-site-verification=xxx │
-│     └─► CNAME record: example.com → pages.zaoya.app                         │
-│                                                                             │
-│  3. User clicks "Verify" or waits for auto-check                            │
-│     └─► Backend queries DNS for TXT record                                  │
-│     └─► If match: mark domain as verified                                   │
-│                                                                             │
-│  4. First request to custom domain                                          │
-│     └─► Caddy asks backend: "Is example.com valid?"                         │
-│     └─► Backend returns 200 (verified domain exists)                        │
-│     └─► Caddy provisions SSL certificate via Let's Encrypt                  │
-│     └─► Caddy proxies request to backend                                    │
-│     └─► Backend serves published page                                       │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+**Users have two paths depending on their registrar capabilities:**
+
+#### Option A: Subdomain (Recommended - Lowest Support Burden)
+
+| Record | Host | Value |
+|--------|------|-------|
+| TXT | `_zaoya-verify` | `zaoya-site-verification={token}` |
+| CNAME | `www` | `pages.zaoya.app` |
+
+User's custom domain: `www.example.com`
+
+#### Option B: Apex/Root Domain
+
+| Record | Host | Value |
+|--------|------|-------|
+| TXT | `_zaoya-verify` | `zaoya-site-verification={token}` |
+| ALIAS/ANAME | `@` | `pages.zaoya.app` |
+| -OR- A | `@` | `{ECS_PUBLIC_IP}` |
+
+User's custom domain: `example.com`
+
+**Note**: Many registrars don't support CNAME at apex (`@`). The UI must clearly show both options with helper text: *"If your provider doesn't support CNAME at @, use ALIAS/ANAME or A record."*
 
 ---
 
@@ -109,21 +147,31 @@ Enable Zaoya users to connect custom domains to their published pages. Users can
 ```sql
 CREATE TABLE custom_domains (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    project_id UUID NOT NULL UNIQUE REFERENCES projects(id) ON DELETE CASCADE,
+    -- UNIQUE enforces 1:1 mapping
 
     -- Domain info
     domain VARCHAR(255) NOT NULL UNIQUE,
+    is_apex BOOLEAN NOT NULL DEFAULT false,  -- true if apex domain (for www redirect logic)
 
     -- Verification
     verification_token VARCHAR(64) NOT NULL,
     verification_status VARCHAR(20) NOT NULL DEFAULT 'pending',
-    -- Values: 'pending', 'verified', 'failed'
+    -- State machine: 'pending' → 'verified' → 'active'
+    --                'pending' → 'failed' (after expiry)
+    --                'verified' → 'error' (SSL issues)
     verified_at TIMESTAMP WITH TIME ZONE,
+    verification_expires_at TIMESTAMP WITH TIME ZONE NOT NULL,  -- created_at + 7 days
 
     -- SSL status (informational, Caddy manages actual certs)
     ssl_status VARCHAR(20) NOT NULL DEFAULT 'pending',
     -- Values: 'pending', 'provisioning', 'active', 'error'
     ssl_provisioned_at TIMESTAMP WITH TIME ZONE,
+
+    -- Operational fields
+    last_checked_at TIMESTAMP WITH TIME ZONE,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    failure_reason VARCHAR(255),
 
     -- Metadata
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
@@ -131,15 +179,34 @@ CREATE TABLE custom_domains (
 
     -- Constraints
     CONSTRAINT valid_verification_status
-        CHECK (verification_status IN ('pending', 'verified', 'failed')),
+        CHECK (verification_status IN ('pending', 'verified', 'failed', 'active')),
     CONSTRAINT valid_ssl_status
         CHECK (ssl_status IN ('pending', 'provisioning', 'active', 'error'))
 );
 
 -- Indexes
-CREATE INDEX idx_custom_domains_project_id ON custom_domains(project_id);
 CREATE INDEX idx_custom_domains_domain ON custom_domains(domain);
 CREATE INDEX idx_custom_domains_verification_status ON custom_domains(verification_status);
+CREATE INDEX idx_custom_domains_verification_expires ON custom_domains(verification_expires_at)
+    WHERE verification_status = 'pending';
+```
+
+### State Machine
+
+```
+                    ┌─────────────────────────────────────────┐
+                    │                                         │
+                    ▼                                         │
+┌─────────┐    TXT record    ┌──────────┐    First HTTPS    ┌────────┐
+│ pending │ ───────ok───────►│ verified │ ────request────►  │ active │
+└─────────┘                  └──────────┘    served ok      └────────┘
+     │                            │                              │
+     │ 7 days expired             │ SSL provision                │ SSL renewal
+     │ or max attempts            │ fails repeatedly             │ fails
+     ▼                            ▼                              ▼
+┌─────────┐                  ┌─────────┐                    ┌─────────┐
+│ failed  │                  │  error  │◄───────────────────│  error  │
+└─────────┘                  └─────────┘                    └─────────┘
 ```
 
 ### SQLAlchemy Model
@@ -147,10 +214,10 @@ CREATE INDEX idx_custom_domains_verification_status ON custom_domains(verificati
 ```python
 # backend/app/models/db/custom_domain.py
 
-from sqlalchemy import Column, String, DateTime, ForeignKey, CheckConstraint
+from sqlalchemy import Column, String, DateTime, ForeignKey, CheckConstraint, Boolean, Integer
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
-from datetime import datetime
+from datetime import datetime, timedelta
 import uuid
 
 from app.models.db import Base
@@ -159,19 +226,32 @@ class CustomDomain(Base):
     __tablename__ = "custom_domains"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    project_id = Column(UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
+    project_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,  # Enforces 1:1 mapping
+        index=True
+    )
 
     # Domain
     domain = Column(String(255), nullable=False, unique=True, index=True)
+    is_apex = Column(Boolean, nullable=False, default=False)
 
     # Verification
     verification_token = Column(String(64), nullable=False)
     verification_status = Column(String(20), nullable=False, default="pending")
     verified_at = Column(DateTime(timezone=True), nullable=True)
+    verification_expires_at = Column(DateTime(timezone=True), nullable=False)
 
     # SSL
     ssl_status = Column(String(20), nullable=False, default="pending")
     ssl_provisioned_at = Column(DateTime(timezone=True), nullable=True)
+
+    # Operational
+    last_checked_at = Column(DateTime(timezone=True), nullable=True)
+    attempt_count = Column(Integer, nullable=False, default=0)
+    failure_reason = Column(String(255), nullable=True)
 
     # Timestamps
     created_at = Column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
@@ -180,9 +260,14 @@ class CustomDomain(Base):
     # Relationships
     project = relationship("Project", back_populates="custom_domain")
 
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        if not self.verification_expires_at:
+            self.verification_expires_at = datetime.utcnow() + timedelta(days=7)
+
     __table_args__ = (
         CheckConstraint(
-            "verification_status IN ('pending', 'verified', 'failed')",
+            "verification_status IN ('pending', 'verified', 'failed', 'active')",
             name="valid_verification_status"
         ),
         CheckConstraint(
@@ -192,12 +277,35 @@ class CustomDomain(Base):
     )
 ```
 
-### Update Project Model
+### New Table: audit_events (Future-Proofing for Teams)
 
-```python
-# Add to Project model
-custom_domain = relationship("CustomDomain", back_populates="project", uselist=False)
+```sql
+CREATE TABLE audit_events (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    team_id UUID,  -- Nullable, for future team support
+
+    action VARCHAR(50) NOT NULL,
+    resource_type VARCHAR(50) NOT NULL,
+    resource_id UUID,
+
+    metadata JSONB,
+    ip_address VARCHAR(45),
+    user_agent VARCHAR(500),
+
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_audit_events_user_id ON audit_events(user_id);
+CREATE INDEX idx_audit_events_resource ON audit_events(resource_type, resource_id);
+CREATE INDEX idx_audit_events_created_at ON audit_events(created_at);
 ```
+
+**Logged actions for custom domains:**
+- `domain.added`
+- `domain.verified`
+- `domain.removed`
+- `domain.verification_failed`
 
 ---
 
@@ -221,28 +329,33 @@ Add a custom domain to a project.
 {
     "id": "uuid",
     "domain": "example.com",
+    "is_apex": true,
     "verification_status": "pending",
-    "verification_token": "abc123xyz...",
+    "verification_expires_at": "2025-01-29T10:00:00Z",
     "ssl_status": "pending",
-    "dns_records": [
-        {
-            "type": "TXT",
-            "host": "_zaoya-verify",
-            "value": "zaoya-site-verification=abc123xyz..."
+    "dns_instructions": {
+        "recommended": {
+            "description": "For subdomain (www.example.com)",
+            "records": [
+                {"type": "TXT", "host": "_zaoya-verify", "value": "zaoya-site-verification=abc123..."},
+                {"type": "CNAME", "host": "www", "value": "pages.zaoya.app"}
+            ]
         },
-        {
-            "type": "CNAME",
-            "host": "@",
-            "value": "pages.zaoya.app"
+        "apex": {
+            "description": "For root domain (example.com)",
+            "records": [
+                {"type": "TXT", "host": "_zaoya-verify", "value": "zaoya-site-verification=abc123..."},
+                {"type": "ALIAS", "host": "@", "value": "pages.zaoya.app", "note": "Or use A record with IP: x.x.x.x"}
+            ]
         }
-    ],
+    },
     "created_at": "2025-01-22T10:00:00Z"
 }
 ```
 
 **Errors:**
 - 400: Invalid domain format
-- 400: Domain already in use
+- 400: Domain already in use by another project
 - 403: Project not owned by user
 - 409: Project already has a custom domain
 
@@ -250,30 +363,7 @@ Add a custom domain to a project.
 
 Get custom domain configuration for a project.
 
-**Response (200):**
-```json
-{
-    "id": "uuid",
-    "domain": "example.com",
-    "verification_status": "verified",
-    "verified_at": "2025-01-22T10:30:00Z",
-    "ssl_status": "active",
-    "ssl_provisioned_at": "2025-01-22T10:31:00Z",
-    "dns_records": [
-        {
-            "type": "TXT",
-            "host": "_zaoya-verify",
-            "value": "zaoya-site-verification=abc123xyz..."
-        },
-        {
-            "type": "CNAME",
-            "host": "@",
-            "value": "pages.zaoya.app"
-        }
-    ],
-    "created_at": "2025-01-22T10:00:00Z"
-}
-```
+**Response (200):** Same as POST response with current status
 
 **Errors:**
 - 404: No custom domain configured
@@ -295,10 +385,11 @@ Manually trigger domain verification check.
 ```json
 {
     "verification_status": "pending",
+    "attempt_count": 3,
     "message": "DNS records not found. Please check your configuration.",
     "checks": {
         "txt_record": false,
-        "cname_record": true
+        "routing_record": true
     }
 }
 ```
@@ -309,20 +400,31 @@ Remove custom domain from project.
 
 **Response (204):** No content
 
-### Internal Endpoints (no auth, called by Caddy)
+### Internal Endpoints (Caddy only)
 
 #### GET /api/internal/domain/check
 
 Called by Caddy to verify if a domain should be issued an SSL certificate.
 
+**Required Headers:**
+- `X-Zaoya-Edge-Secret`: Must match `ZAOYA_EDGE_SECRET` env var
+
 **Query Parameters:**
-- `domain`: The domain to check (e.g., `example.com`)
+- `domain`: The domain to check (normalized, lowercase, no trailing dot)
 
 **Response (200):** Domain is valid, proceed with SSL
 ```json
 {
     "valid": true,
-    "project_id": "uuid"
+    "project_id": "uuid",
+    "is_apex": true
+}
+```
+
+**Response (403):** Invalid or missing edge secret
+```json
+{
+    "error": "Forbidden"
 }
 ```
 
@@ -334,9 +436,11 @@ Called by Caddy to verify if a domain should be issued an SSL certificate.
 }
 ```
 
-**Security:**
-- This endpoint should only be accessible from the Caddy server IP
-- Consider adding a shared secret header for additional security
+**Security (Defense in Depth):**
+1. **Required**: Shared secret header (`X-Zaoya-Edge-Secret`)
+2. **Recommended**: Source IP allowlist (Caddy server IP)
+3. **Required**: Rate limiting (10 req/min per unique domain)
+4. **Required**: Strict domain validation (normalize, lowercase, reject invalid chars)
 
 ---
 
@@ -350,7 +454,8 @@ Called by Caddy to verify if a domain should be issued an SSL certificate.
 import dns.resolver
 import secrets
 import re
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
+from datetime import datetime, timedelta
 
 class DomainService:
     """Service for custom domain management"""
@@ -358,27 +463,65 @@ class DomainService:
     VERIFICATION_PREFIX = "zaoya-site-verification="
     PAGES_DOMAIN = "pages.zaoya.app"
 
+    # Blocked zones (exact match or suffix)
+    BLOCKED_ZONES = [
+        "zaoya.app",
+        "zaoya.com",
+        "localhost",
+        "local",
+        "internal",
+        "example.com",
+        "example.org",
+        "example.net",
+        "test",
+        "invalid",
+    ]
+
+    @staticmethod
+    def normalize_domain(domain: str) -> str:
+        """Normalize domain: lowercase, strip whitespace, remove trailing dot"""
+        return domain.lower().strip().rstrip(".")
+
     @staticmethod
     def validate_domain(domain: str) -> Tuple[bool, Optional[str]]:
         """
         Validate domain format.
         Returns (is_valid, error_message)
         """
+        domain = DomainService.normalize_domain(domain)
+
+        # Check length
+        if len(domain) > 253:
+            return False, "Domain too long (max 253 characters)"
+
+        # ASCII only for v1 (no punycode/IDN)
+        if not domain.isascii():
+            return False, "Only ASCII domains are supported"
+
         # Basic format check
-        domain_pattern = r'^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$'
+        domain_pattern = r'^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$'
         if not re.match(domain_pattern, domain):
             return False, "Invalid domain format"
 
-        # Block zaoya domains
-        if "zaoya" in domain.lower():
-            return False, "Cannot use zaoya domains"
+        # Check for IP addresses
+        ip_pattern = r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$'
+        if re.match(ip_pattern, domain):
+            return False, "IP addresses are not allowed"
 
-        # Block common reserved domains
-        blocked = ["localhost", "example.com", "test.com"]
-        if domain.lower() in blocked:
-            return False, "This domain is not allowed"
+        # Block reserved zones (exact match or suffix)
+        for blocked in DomainService.BLOCKED_ZONES:
+            if domain == blocked or domain.endswith(f".{blocked}"):
+                return False, f"Domain '{blocked}' is not allowed"
 
         return True, None
+
+    @staticmethod
+    def is_apex_domain(domain: str) -> bool:
+        """Check if domain is apex (no subdomain prefix)"""
+        parts = domain.split(".")
+        # apex: example.com (2 parts) or example.co.uk (3 parts with known SLD)
+        # For simplicity, treat 2-part domains as apex
+        return len(parts) == 2
 
     @staticmethod
     def generate_verification_token() -> str:
@@ -386,36 +529,65 @@ class DomainService:
         return secrets.token_urlsafe(32)
 
     @staticmethod
-    def get_dns_instructions(domain: str, token: str) -> list:
+    def get_dns_instructions(domain: str, token: str, edge_ip: str) -> dict:
         """Return DNS record instructions for the user"""
-        return [
-            {
-                "type": "TXT",
-                "host": "_zaoya-verify",
-                "value": f"zaoya-site-verification={token}",
-                "description": "Verification record to prove domain ownership"
+        base_domain = ".".join(domain.split(".")[-2:])  # Get apex from any subdomain
+
+        return {
+            "recommended": {
+                "description": f"For subdomain (www.{base_domain})",
+                "records": [
+                    {
+                        "type": "TXT",
+                        "host": "_zaoya-verify",
+                        "value": f"zaoya-site-verification={token}",
+                    },
+                    {
+                        "type": "CNAME",
+                        "host": "www",
+                        "value": "pages.zaoya.app",
+                    }
+                ]
             },
-            {
-                "type": "CNAME",
-                "host": "@",
-                "value": "pages.zaoya.app",
-                "description": "Points your domain to Zaoya servers"
-            }
-        ]
+            "apex": {
+                "description": f"For root domain ({base_domain})",
+                "records": [
+                    {
+                        "type": "TXT",
+                        "host": "_zaoya-verify",
+                        "value": f"zaoya-site-verification={token}",
+                    },
+                    {
+                        "type": "ALIAS/ANAME",
+                        "host": "@",
+                        "value": "pages.zaoya.app",
+                        "note": f"If ALIAS not supported, use A record: {edge_ip}",
+                    }
+                ]
+            },
+            "help_text": "If your provider doesn't support CNAME/ALIAS at @, use an A record pointing to our server IP."
+        }
 
     @staticmethod
     async def verify_txt_record(domain: str, expected_token: str) -> bool:
         """Check if TXT record exists with correct token"""
+        domain = DomainService.normalize_domain(domain)
+        # Get base domain for TXT lookup
+        parts = domain.split(".")
+        base_domain = ".".join(parts[-2:]) if len(parts) > 2 else domain
+
         try:
             answers = dns.resolver.resolve(
-                f"_zaoya-verify.{domain}",
+                f"_zaoya-verify.{base_domain}",
                 "TXT",
-                lifetime=10  # 10 second timeout
+                lifetime=10
             )
 
             for rdata in answers:
-                # TXT records may be split into multiple strings
-                txt_value = "".join([s.decode() if isinstance(s, bytes) else s for s in rdata.strings])
+                txt_value = "".join([
+                    s.decode() if isinstance(s, bytes) else s
+                    for s in rdata.strings
+                ])
                 expected = f"zaoya-site-verification={expected_token}"
                 if txt_value == expected:
                     return True
@@ -427,21 +599,37 @@ class DomainService:
             return False
 
     @staticmethod
-    async def verify_cname_record(domain: str) -> bool:
-        """Check if CNAME points to pages.zaoya.app"""
+    async def verify_routing_record(domain: str) -> Tuple[bool, str]:
+        """
+        Check if domain has valid routing to our edge.
+        Returns (is_valid, record_type)
+        """
+        domain = DomainService.normalize_domain(domain)
+
+        # Try CNAME first
         try:
             answers = dns.resolver.resolve(domain, "CNAME", lifetime=10)
             for rdata in answers:
-                target = str(rdata.target).rstrip(".")
-                if target.lower() == "pages.zaoya.app":
-                    return True
-            return False
-        except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
-            # CNAME might not exist if using A record - that's also valid
-            # The actual routing will be verified when Caddy proxies
-            return True
+                target = str(rdata.target).rstrip(".").lower()
+                if target == "pages.zaoya.app":
+                    return True, "CNAME"
+        except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer, dns.resolver.Timeout):
+            pass
         except Exception:
-            return True  # Don't block on CNAME check failures
+            pass
+
+        # Try A record (we can't verify it points to us without knowing all our IPs)
+        # Just check if A record exists - actual routing will be validated on request
+        try:
+            answers = dns.resolver.resolve(domain, "A", lifetime=10)
+            if answers:
+                return True, "A"  # Has A record, assume user configured correctly
+        except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer, dns.resolver.Timeout):
+            pass
+        except Exception:
+            pass
+
+        return False, "none"
 
     @staticmethod
     async def verify_domain(domain: str, expected_token: str) -> dict:
@@ -450,314 +638,275 @@ class DomainService:
         Returns dict with check results.
         """
         txt_valid = await DomainService.verify_txt_record(domain, expected_token)
-        cname_valid = await DomainService.verify_cname_record(domain)
+        routing_valid, routing_type = await DomainService.verify_routing_record(domain)
 
         return {
-            "verified": txt_valid,  # TXT is required, CNAME is advisory
+            "verified": txt_valid,  # TXT is required for ownership proof
             "checks": {
                 "txt_record": txt_valid,
-                "cname_record": cname_valid
+                "routing_record": routing_valid,
+                "routing_type": routing_type,
             }
         }
+```
+
+### AccessControlService (Future-Proofing for Teams)
+
+```python
+# backend/app/services/access_control.py
+
+from typing import Optional
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.models.db.project import Project
+from app.models.db.user import User
+
+class Permission:
+    PROJECT_VIEW = "project:view"
+    PROJECT_EDIT = "project:edit"
+    PROJECT_DELETE = "project:delete"
+    PROJECT_PUBLISH = "project:publish"
+    DOMAIN_MANAGE = "domain:manage"
+
+class AccessControlService:
+    """
+    Centralized permission checks.
+    Currently user-only; ready for team RBAC extension.
+    """
+
+    @staticmethod
+    async def can_access_project(
+        db: AsyncSession,
+        user: User,
+        project: Project,
+        permission: str
+    ) -> bool:
+        """
+        Check if user has permission on project.
+        For v1: Owner has all permissions.
+        For v2+: Will check team membership and roles.
+        """
+        # v1: Simple owner check
+        if project.user_id == user.id:
+            return True
+
+        # Future: Check team membership
+        # if project.owner_type == "team":
+        #     member = await get_team_member(db, project.owner_id, user.id)
+        #     if member:
+        #         return permission in get_role_permissions(member.role)
+
+        return False
+
+    @staticmethod
+    async def require_project_access(
+        db: AsyncSession,
+        user: User,
+        project: Project,
+        permission: str
+    ) -> None:
+        """Raise HTTPException if access denied"""
+        from fastapi import HTTPException
+
+        if not await AccessControlService.can_access_project(db, user, project, permission):
+            raise HTTPException(status_code=403, detail="Access denied")
 ```
 
 ---
 
 ## Middleware
 
-### CustomDomainMiddleware
+### CustomDomainMiddleware (Secure)
 
 ```python
 # backend/app/middleware/custom_domain.py
 
+import os
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
+from starlette.responses import Response
 
 class CustomDomainMiddleware(BaseHTTPMiddleware):
     """
     Middleware to detect and handle custom domain requests.
 
+    SECURITY: Only trusts X-Custom-Domain header when:
+    1. Valid X-Zaoya-Edge-Secret is present, AND
+    2. (Optional) Request is from allowed edge IP
+
     When Caddy proxies a request, it adds:
     - X-Custom-Domain: The original host header (e.g., example.com)
+    - X-Zaoya-Edge-Secret: Shared secret for authentication
     - X-Forwarded-Proto: The original protocol (https)
     """
 
     ZAOYA_DOMAINS = ["zaoya.app", "localhost", "127.0.0.1"]
 
-    async def dispatch(self, request: Request, call_next):
-        custom_domain = request.headers.get("X-Custom-Domain")
+    def __init__(self, app, edge_secret: str = None, allowed_edge_ips: list = None):
+        super().__init__(app)
+        self.edge_secret = edge_secret or os.environ.get("ZAOYA_EDGE_SECRET")
+        self.allowed_edge_ips = allowed_edge_ips or []
 
-        # Check if this is a custom domain request
+    async def dispatch(self, request: Request, call_next):
+        custom_domain = None
         is_custom_domain = False
-        if custom_domain:
+
+        # Only trust X-Custom-Domain if edge secret is valid
+        provided_secret = request.headers.get("X-Zaoya-Edge-Secret")
+        header_domain = request.headers.get("X-Custom-Domain")
+
+        if header_domain and self._is_valid_edge_request(request, provided_secret):
+            # Normalize domain
+            normalized = header_domain.lower().strip().rstrip(".")
+
+            # Check if this is actually a custom domain (not our own)
             is_custom_domain = not any(
-                custom_domain.endswith(d) for d in self.ZAOYA_DOMAINS
+                normalized.endswith(d) for d in self.ZAOYA_DOMAINS
             )
 
+            if is_custom_domain:
+                custom_domain = normalized
+
         # Attach to request state for downstream handlers
-        request.state.custom_domain = custom_domain if is_custom_domain else None
+        request.state.custom_domain = custom_domain
         request.state.is_custom_domain = is_custom_domain
 
         response = await call_next(request)
         return response
+
+    def _is_valid_edge_request(self, request: Request, provided_secret: str) -> bool:
+        """Validate the request is from our edge server"""
+        # Check secret
+        if not self.edge_secret or provided_secret != self.edge_secret:
+            return False
+
+        # Optional: Check source IP
+        if self.allowed_edge_ips:
+            client_ip = request.client.host if request.client else None
+            forwarded_for = request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+            real_ip = request.headers.get("X-Real-IP")
+
+            request_ip = real_ip or forwarded_for or client_ip
+            if request_ip not in self.allowed_edge_ips:
+                return False
+
+        return True
 ```
 
 ---
 
-## Frontend Components
+## Internal Endpoint Security
 
-### Component Structure
+### Domain Check Endpoint (Hardened)
 
-```
-frontend/src/components/domain/
-├── DomainSettings.tsx        # Main container component
-├── DomainForm.tsx            # Add domain form
-├── DomainStatus.tsx          # Status badge component
-├── DnsInstructions.tsx       # DNS records table with copy
-├── DomainVerifying.tsx       # Verification in progress UI
-└── index.ts                  # Exports
-```
+```python
+# backend/app/api/internal.py
 
-### DomainSettings.tsx (Main Component)
+import os
+import re
+from fastapi import APIRouter, Request, HTTPException, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from datetime import datetime
 
-```tsx
-// frontend/src/components/domain/DomainSettings.tsx
+from app.models.db.custom_domain import CustomDomain
+from app.database import get_db
 
-import { useState, useEffect } from 'react';
-import { useProjectStore } from '@/stores/projectStore';
-import { DomainForm } from './DomainForm';
-import { DomainStatus } from './DomainStatus';
-import { DnsInstructions } from './DnsInstructions';
+router = APIRouter(prefix="/api/internal", tags=["internal"])
 
-interface CustomDomainData {
-  id: string;
-  domain: string;
-  verification_status: 'pending' | 'verified' | 'failed';
-  ssl_status: 'pending' | 'provisioning' | 'active' | 'error';
-  dns_records: DnsRecord[];
-  verified_at?: string;
-}
+EDGE_SECRET = os.environ.get("ZAOYA_EDGE_SECRET")
 
-interface DnsRecord {
-  type: string;
-  host: string;
-  value: string;
-}
+def verify_edge_secret(request: Request):
+    """Dependency to verify edge server authentication"""
+    provided = request.headers.get("X-Zaoya-Edge-Secret")
+    if not EDGE_SECRET or provided != EDGE_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
 
-export function DomainSettings() {
-  const { currentProject } = useProjectStore();
-  const [domainData, setDomainData] = useState<CustomDomainData | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [verifying, setVerifying] = useState(false);
+def normalize_and_validate_domain(domain: str) -> str:
+    """Normalize and strictly validate domain input"""
+    if not domain:
+        raise HTTPException(status_code=400, detail="Domain required")
 
-  // Fetch domain data on mount
-  useEffect(() => {
-    fetchDomainData();
-  }, [currentProject?.id]);
+    # Normalize
+    domain = domain.lower().strip().rstrip(".")
 
-  // Auto-refresh when pending
-  useEffect(() => {
-    if (domainData?.verification_status === 'pending') {
-      const interval = setInterval(fetchDomainData, 30000); // 30 seconds
-      return () => clearInterval(interval);
+    # Length check
+    if len(domain) > 253:
+        raise HTTPException(status_code=400, detail="Domain too long")
+
+    # ASCII only
+    if not domain.isascii():
+        raise HTTPException(status_code=400, detail="Invalid domain")
+
+    # Format check (strict)
+    pattern = r'^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$'
+    if not re.match(pattern, domain):
+        raise HTTPException(status_code=400, detail="Invalid domain format")
+
+    # No ports
+    if ":" in domain:
+        raise HTTPException(status_code=400, detail="Invalid domain")
+
+    return domain
+
+@router.get("/domain/check")
+async def check_domain(
+    domain: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    _: None = Depends(verify_edge_secret)  # Security check
+):
+    """
+    Called by Caddy to verify if a domain should be issued an SSL certificate.
+    Protected by shared secret.
+    """
+    # Validate and normalize input
+    domain = normalize_and_validate_domain(domain)
+
+    # Look up domain
+    result = await db.execute(
+        select(CustomDomain)
+        .where(CustomDomain.domain == domain)
+        .where(CustomDomain.verification_status.in_(["verified", "active"]))
+    )
+    custom_domain = result.scalar_one_or_none()
+
+    if not custom_domain:
+        return {"valid": False, "reason": "Domain not found or not verified"}
+
+    # Update SSL status on first successful check
+    if custom_domain.ssl_status == "pending":
+        custom_domain.ssl_status = "provisioning"
+        await db.commit()
+
+    return {
+        "valid": True,
+        "project_id": str(custom_domain.project_id),
+        "is_apex": custom_domain.is_apex
     }
-  }, [domainData?.verification_status]);
 
-  const fetchDomainData = async () => {
-    try {
-      const res = await fetch(`/api/projects/${currentProject?.id}/domain`);
-      if (res.ok) {
-        setDomainData(await res.json());
-      } else if (res.status === 404) {
-        setDomainData(null);
-      }
-    } finally {
-      setLoading(false);
-    }
-  };
+@router.post("/domain/{domain}/ssl-active")
+async def mark_ssl_active(
+    domain: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    _: None = Depends(verify_edge_secret)
+):
+    """Called by Caddy after successful SSL provisioning"""
+    domain = normalize_and_validate_domain(domain)
 
-  const handleAddDomain = async (domain: string) => {
-    const res = await fetch(`/api/projects/${currentProject?.id}/domain`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ domain }),
-    });
-    if (res.ok) {
-      setDomainData(await res.json());
-    }
-  };
+    result = await db.execute(
+        select(CustomDomain).where(CustomDomain.domain == domain)
+    )
+    custom_domain = result.scalar_one_or_none()
 
-  const handleVerify = async () => {
-    setVerifying(true);
-    try {
-      const res = await fetch(`/api/projects/${currentProject?.id}/domain/verify`, {
-        method: 'POST',
-      });
-      if (res.ok) {
-        const data = await res.json();
-        setDomainData(prev => prev ? { ...prev, ...data } : null);
-      }
-    } finally {
-      setVerifying(false);
-    }
-  };
+    if custom_domain:
+        custom_domain.ssl_status = "active"
+        custom_domain.ssl_provisioned_at = datetime.utcnow()
+        if custom_domain.verification_status == "verified":
+            custom_domain.verification_status = "active"
+        await db.commit()
 
-  const handleRemove = async () => {
-    if (!confirm('Remove custom domain? This cannot be undone.')) return;
-
-    await fetch(`/api/projects/${currentProject?.id}/domain`, {
-      method: 'DELETE',
-    });
-    setDomainData(null);
-  };
-
-  if (loading) {
-    return <div className="animate-pulse">Loading...</div>;
-  }
-
-  // No domain configured
-  if (!domainData) {
-    return (
-      <div className="space-y-4">
-        <h3 className="text-lg font-medium">Custom Domain</h3>
-        <p className="text-sm text-gray-500">
-          Connect your own domain to this project.
-        </p>
-        <DomainForm onSubmit={handleAddDomain} />
-      </div>
-    );
-  }
-
-  // Domain configured
-  return (
-    <div className="space-y-4">
-      <div className="flex items-center justify-between">
-        <h3 className="text-lg font-medium">Custom Domain</h3>
-        <button
-          onClick={handleRemove}
-          className="text-sm text-red-600 hover:text-red-700"
-        >
-          Remove
-        </button>
-      </div>
-
-      <div className="p-4 border rounded-lg space-y-4">
-        <div className="flex items-center justify-between">
-          <span className="font-medium">{domainData.domain}</span>
-          <DomainStatus
-            verificationStatus={domainData.verification_status}
-            sslStatus={domainData.ssl_status}
-          />
-        </div>
-
-        {domainData.verification_status === 'pending' && (
-          <>
-            <DnsInstructions records={domainData.dns_records} />
-            <button
-              onClick={handleVerify}
-              disabled={verifying}
-              className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50"
-            >
-              {verifying ? 'Checking...' : 'Check Verification'}
-            </button>
-            <p className="text-xs text-gray-500">
-              DNS changes can take up to 48 hours to propagate.
-            </p>
-          </>
-        )}
-
-        {domainData.verification_status === 'verified' && (
-          <p className="text-sm text-green-600">
-            Your domain is active! Visit{' '}
-            <a
-              href={`https://${domainData.domain}`}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="underline"
-            >
-              https://{domainData.domain}
-            </a>
-          </p>
-        )}
-      </div>
-    </div>
-  );
-}
-```
-
-### DnsInstructions.tsx
-
-```tsx
-// frontend/src/components/domain/DnsInstructions.tsx
-
-import { useState } from 'react';
-import { Copy, Check } from 'lucide-react';
-
-interface DnsRecord {
-  type: string;
-  host: string;
-  value: string;
-}
-
-interface Props {
-  records: DnsRecord[];
-}
-
-export function DnsInstructions({ records }: Props) {
-  const [copied, setCopied] = useState<string | null>(null);
-
-  const copyToClipboard = async (text: string, id: string) => {
-    await navigator.clipboard.writeText(text);
-    setCopied(id);
-    setTimeout(() => setCopied(null), 2000);
-  };
-
-  return (
-    <div className="space-y-3">
-      <p className="text-sm font-medium">
-        Add these DNS records at your domain registrar:
-      </p>
-
-      <div className="overflow-x-auto">
-        <table className="min-w-full text-sm">
-          <thead>
-            <tr className="border-b">
-              <th className="text-left py-2 pr-4">Type</th>
-              <th className="text-left py-2 pr-4">Host</th>
-              <th className="text-left py-2">Value</th>
-            </tr>
-          </thead>
-          <tbody>
-            {records.map((record, i) => (
-              <tr key={i} className="border-b">
-                <td className="py-2 pr-4 font-mono">{record.type}</td>
-                <td className="py-2 pr-4 font-mono">{record.host}</td>
-                <td className="py-2">
-                  <div className="flex items-center gap-2">
-                    <code className="text-xs bg-gray-100 px-2 py-1 rounded break-all">
-                      {record.value}
-                    </code>
-                    <button
-                      onClick={() => copyToClipboard(record.value, `${i}`)}
-                      className="p-1 hover:bg-gray-100 rounded"
-                      title="Copy"
-                    >
-                      {copied === `${i}` ? (
-                        <Check className="w-4 h-4 text-green-600" />
-                      ) : (
-                        <Copy className="w-4 h-4 text-gray-400" />
-                      )}
-                    </button>
-                  </div>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-    </div>
-  );
-}
+    return {"status": "ok"}
 ```
 
 ---
@@ -769,10 +918,10 @@ export function DnsInstructions({ records }: Props) {
 | Requirement | Specification |
 |-------------|---------------|
 | OS | Ubuntu 22.04 LTS or Debian 12 |
-| vCPU | 1 core minimum |
-| RAM | 1 GB minimum |
+| vCPU | 1 core minimum (2 recommended) |
+| RAM | 1 GB minimum (2 GB recommended) |
 | Storage | 20 GB SSD |
-| Network | Public IP address |
+| Network | Public IP address (elastic IP recommended) |
 | Bandwidth | 1 Mbps minimum |
 
 ### Security Group Rules
@@ -781,10 +930,10 @@ export function DnsInstructions({ records }: Props) {
 |-----------|----------|------|--------|-------------|
 | Inbound | TCP | 80 | 0.0.0.0/0 | HTTP (for ACME challenges) |
 | Inbound | TCP | 443 | 0.0.0.0/0 | HTTPS |
-| Inbound | TCP | 22 | Your IP | SSH access |
+| Inbound | TCP | 22 | Your IP only | SSH access |
 | Outbound | All | All | 0.0.0.0/0 | Allow all outbound |
 
-### Caddy Installation Script
+### Caddy Installation Script (with Security)
 
 ```bash
 #!/bin/bash
@@ -793,303 +942,386 @@ export function DnsInstructions({ records }: Props) {
 
 set -e
 
+# Configuration - SET THESE
+ZAOYA_EDGE_SECRET="${ZAOYA_EDGE_SECRET:-$(openssl rand -base64 32)}"
+ZAOYA_BACKEND_URL="${ZAOYA_BACKEND_URL:-https://api.zaoya.app}"
+
 echo "=== Installing Caddy ==="
 
-# Install dependencies
 apt update
 apt install -y debian-keyring debian-archive-keyring apt-transport-https curl
 
-# Add Caddy repository
 curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
 curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | tee /etc/apt/sources.list.d/caddy-stable.list
 
-# Install Caddy
 apt update
 apt install -y caddy
 
 echo "=== Configuring Caddy ==="
 
-# Backup default config
 mv /etc/caddy/Caddyfile /etc/caddy/Caddyfile.default
 
-# Create Zaoya Caddyfile
-cat > /etc/caddy/Caddyfile << 'EOF'
+cat > /etc/caddy/Caddyfile << EOF
 {
-    # Global options
     email admin@zaoya.app
 
-    # On-demand TLS configuration
     on_demand_tls {
-        # Ask backend if domain is valid before issuing cert
-        ask https://api.zaoya.app/api/internal/domain/check
-
-        # Rate limiting to prevent abuse
+        ask ${ZAOYA_BACKEND_URL}/api/internal/domain/check
         interval 1m
         burst 5
     }
 }
 
-# Catch-all server for custom domains
+# Catch-all for custom domains
 https:// {
     tls {
         on_demand
     }
 
-    # Proxy to Zaoya backend
-    reverse_proxy https://api.zaoya.app {
-        # Pass original host
+    # Handle www -> apex redirect for apex domains
+    @www_redirect {
+        header_regexp host Host ^www\.(.+)$
+    }
+    # Note: Redirect logic handled by backend based on is_apex flag
+
+    reverse_proxy ${ZAOYA_BACKEND_URL} {
         header_up X-Custom-Domain {host}
+        header_up X-Zaoya-Edge-Secret ${ZAOYA_EDGE_SECRET}
         header_up X-Real-IP {remote_host}
         header_up X-Forwarded-Proto {scheme}
 
-        # Health check
         health_uri /health
         health_interval 30s
     }
 
-    # Logging
     log {
-        output file /var/log/caddy/access.log
+        output file /var/log/caddy/access.log {
+            roll_size 100mb
+            roll_keep 5
+        }
         format json
     }
 }
 
-# Health check endpoint (internal)
 http://:8080 {
     respond /health "OK" 200
 }
 EOF
 
-# Create log directory
 mkdir -p /var/log/caddy
 chown caddy:caddy /var/log/caddy
 
 echo "=== Starting Caddy ==="
 
-# Enable and start Caddy
 systemctl enable caddy
 systemctl restart caddy
-
-# Check status
 systemctl status caddy
 
 echo "=== Setup Complete ==="
-echo "Caddy is now running and will proxy custom domain requests."
-echo "Make sure to:"
-echo "1. Point pages.zaoya.app A record to this server's IP"
-echo "2. Update backend to handle /api/internal/domain/check endpoint"
+echo ""
+echo "IMPORTANT: Save this edge secret and add to backend env:"
+echo "ZAOYA_EDGE_SECRET=${ZAOYA_EDGE_SECRET}"
+echo ""
+echo "Next steps:"
+echo "1. Add this IP to backend ALLOWED_EDGE_IPS if using IP allowlist"
+echo "2. Point pages.zaoya.app A record to this server's IP"
 ```
 
-### DNS Configuration for pages.zaoya.app
+### HA/Scaling Notes (Phase 3.5 / Ops)
 
-At your domain registrar for zaoya.app:
+> **Warning**: v1 starts with a single Caddy instance. For production reliability:
 
-| Type | Host | Value | TTL |
-|------|------|-------|-----|
-| A | pages | {ECS_PUBLIC_IP} | 300 |
+1. **Multiple Instances**: Deploy 2+ Caddy instances behind a load balancer
+2. **Shared Certificate Storage**: Use Caddy's storage modules (Redis, Consul, S3) to share certs across nodes
+3. **Centralized Logging**: Ship logs to centralized system (ELK, Loki)
+4. **Health Checks**: Load balancer should check `/health` endpoint on port 8080
+5. **Sticky Sessions**: Not required (stateless proxy)
 
 ---
 
 ## Background Jobs
 
-### Domain Verification Job
+### Domain Verification Job (with Expiry)
 
 ```python
 # backend/app/jobs/domain_verification.py
 
 from datetime import datetime, timedelta
-from sqlalchemy import select
+from sqlalchemy import select, and_
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from app.models.db.custom_domain import CustomDomain
 from app.services.domain_service import DomainService
+from app.services.audit_service import AuditService
 
-async def domain_verification_job(db_session):
+MAX_VERIFICATION_ATTEMPTS = 100  # ~8 hours at 5-min intervals
+
+async def domain_verification_job(db: AsyncSession):
     """
     Background job to automatically verify pending domains.
     Run every 5 minutes via scheduler.
     """
-    # Get pending domains that haven't been checked recently
-    cutoff = datetime.utcnow() - timedelta(minutes=5)
+    now = datetime.utcnow()
 
-    result = await db_session.execute(
+    # 1. Expire old pending domains
+    expired_result = await db.execute(
         select(CustomDomain)
         .where(CustomDomain.verification_status == "pending")
-        .where(CustomDomain.updated_at < cutoff)
+        .where(CustomDomain.verification_expires_at < now)
+    )
+    for domain in expired_result.scalars().all():
+        domain.verification_status = "failed"
+        domain.failure_reason = "Verification period expired (7 days)"
+        await AuditService.log(
+            db,
+            action="domain.verification_failed",
+            resource_type="custom_domain",
+            resource_id=domain.id,
+            metadata={"reason": "expired"}
+        )
+
+    # 2. Check pending domains not checked in last 5 minutes
+    cutoff = now - timedelta(minutes=5)
+
+    result = await db.execute(
+        select(CustomDomain)
+        .where(CustomDomain.verification_status == "pending")
+        .where(
+            (CustomDomain.last_checked_at == None) |
+            (CustomDomain.last_checked_at < cutoff)
+        )
+        .where(CustomDomain.attempt_count < MAX_VERIFICATION_ATTEMPTS)
     )
 
-    pending_domains = result.scalars().all()
-
-    for domain in pending_domains:
+    for domain in result.scalars().all():
         try:
             verification = await DomainService.verify_domain(
                 domain.domain,
                 domain.verification_token
             )
 
+            domain.last_checked_at = now
+            domain.attempt_count += 1
+
             if verification["verified"]:
                 domain.verification_status = "verified"
-                domain.verified_at = datetime.utcnow()
+                domain.verified_at = now
+                domain.failure_reason = None
 
-                # TODO: Send verification success email
-                # await send_domain_verified_email(domain)
-
-            domain.updated_at = datetime.utcnow()
+                await AuditService.log(
+                    db,
+                    action="domain.verified",
+                    resource_type="custom_domain",
+                    resource_id=domain.id
+                )
 
         except Exception as e:
-            # Log error but continue with other domains
-            print(f"Error verifying domain {domain.domain}: {e}")
+            domain.last_checked_at = now
+            domain.attempt_count += 1
+            # Log but continue
 
-    await db_session.commit()
+    await db.commit()
 ```
 
-### Scheduler Configuration
+---
 
-```python
-# backend/app/main.py (add to startup)
+## Frontend Components
 
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from app.jobs.domain_verification import domain_verification_job
+### DnsInstructions.tsx (Updated with Both Options)
 
-scheduler = AsyncIOScheduler()
+```tsx
+// frontend/src/components/domain/DnsInstructions.tsx
 
-@app.on_event("startup")
-async def start_scheduler():
-    scheduler.add_job(
-        domain_verification_job,
-        "interval",
-        minutes=5,
-        id="domain_verification",
-        replace_existing=True
-    )
-    scheduler.start()
+import { useState } from 'react';
+import { Copy, Check, AlertCircle } from 'lucide-react';
 
-@app.on_event("shutdown")
-async def stop_scheduler():
-    scheduler.shutdown()
+interface DnsInstructions {
+  recommended: {
+    description: string;
+    records: DnsRecord[];
+  };
+  apex: {
+    description: string;
+    records: DnsRecord[];
+  };
+  help_text: string;
+}
+
+interface DnsRecord {
+  type: string;
+  host: string;
+  value: string;
+  note?: string;
+}
+
+interface Props {
+  instructions: DnsInstructions;
+  domain: string;
+}
+
+export function DnsInstructions({ instructions, domain }: Props) {
+  const [copied, setCopied] = useState<string | null>(null);
+  const [showApex, setShowApex] = useState(false);
+
+  const copyToClipboard = async (text: string, id: string) => {
+    await navigator.clipboard.writeText(text);
+    setCopied(id);
+    setTimeout(() => setCopied(null), 2000);
+  };
+
+  const renderRecords = (records: DnsRecord[], prefix: string) => (
+    <table className="min-w-full text-sm">
+      <thead>
+        <tr className="border-b">
+          <th className="text-left py-2 pr-4">Type</th>
+          <th className="text-left py-2 pr-4">Host</th>
+          <th className="text-left py-2">Value</th>
+        </tr>
+      </thead>
+      <tbody>
+        {records.map((record, i) => (
+          <tr key={i} className="border-b">
+            <td className="py-2 pr-4 font-mono text-xs">{record.type}</td>
+            <td className="py-2 pr-4 font-mono text-xs">{record.host}</td>
+            <td className="py-2">
+              <div className="flex flex-col gap-1">
+                <div className="flex items-center gap-2">
+                  <code className="text-xs bg-gray-100 px-2 py-1 rounded break-all">
+                    {record.value}
+                  </code>
+                  <button
+                    onClick={() => copyToClipboard(record.value, `${prefix}-${i}`)}
+                    className="p-1 hover:bg-gray-100 rounded shrink-0"
+                    title="Copy"
+                  >
+                    {copied === `${prefix}-${i}` ? (
+                      <Check className="w-4 h-4 text-green-600" />
+                    ) : (
+                      <Copy className="w-4 h-4 text-gray-400" />
+                    )}
+                  </button>
+                </div>
+                {record.note && (
+                  <span className="text-xs text-gray-500">{record.note}</span>
+                )}
+              </div>
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+
+  return (
+    <div className="space-y-4">
+      <p className="text-sm font-medium">
+        Add these DNS records at your domain registrar:
+      </p>
+
+      {/* Tab switcher */}
+      <div className="flex border-b">
+        <button
+          onClick={() => setShowApex(false)}
+          className={`px-4 py-2 text-sm font-medium border-b-2 -mb-px ${
+            !showApex
+              ? 'border-blue-600 text-blue-600'
+              : 'border-transparent text-gray-500 hover:text-gray-700'
+          }`}
+        >
+          Subdomain (Recommended)
+        </button>
+        <button
+          onClick={() => setShowApex(true)}
+          className={`px-4 py-2 text-sm font-medium border-b-2 -mb-px ${
+            showApex
+              ? 'border-blue-600 text-blue-600'
+              : 'border-transparent text-gray-500 hover:text-gray-700'
+          }`}
+        >
+          Root Domain
+        </button>
+      </div>
+
+      {/* Instructions */}
+      <div className="p-4 bg-gray-50 rounded-lg">
+        <p className="text-sm text-gray-600 mb-3">
+          {showApex ? instructions.apex.description : instructions.recommended.description}
+        </p>
+        {renderRecords(
+          showApex ? instructions.apex.records : instructions.recommended.records,
+          showApex ? 'apex' : 'rec'
+        )}
+      </div>
+
+      {/* Help text */}
+      <div className="flex items-start gap-2 p-3 bg-amber-50 border border-amber-200 rounded-lg">
+        <AlertCircle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+        <p className="text-xs text-amber-800">
+          {instructions.help_text}
+        </p>
+      </div>
+    </div>
+  );
+}
 ```
 
 ---
 
 ## Testing Plan
 
-### Unit Tests
-
-```python
-# backend/tests/test_domain_service.py
-
-import pytest
-from app.services.domain_service import DomainService
-
-class TestDomainService:
-
-    def test_validate_domain_valid(self):
-        valid, error = DomainService.validate_domain("example.com")
-        assert valid is True
-        assert error is None
-
-    def test_validate_domain_invalid_format(self):
-        valid, error = DomainService.validate_domain("not-a-domain")
-        assert valid is False
-        assert "Invalid domain" in error
-
-    def test_validate_domain_blocks_zaoya(self):
-        valid, error = DomainService.validate_domain("fake.zaoya.app")
-        assert valid is False
-        assert "zaoya" in error.lower()
-
-    def test_generate_verification_token(self):
-        token = DomainService.generate_verification_token()
-        assert len(token) > 20
-        assert token.isalnum() or "-" in token or "_" in token
-
-    def test_get_dns_instructions(self):
-        records = DomainService.get_dns_instructions("example.com", "abc123")
-        assert len(records) == 2
-        assert records[0]["type"] == "TXT"
-        assert records[1]["type"] == "CNAME"
-        assert "abc123" in records[0]["value"]
-```
-
-### Integration Tests
-
-```python
-# backend/tests/test_domain_api.py
-
-import pytest
-from httpx import AsyncClient
-
-class TestDomainAPI:
-
-    async def test_add_domain(self, client: AsyncClient, auth_headers):
-        response = await client.post(
-            "/api/projects/test-project-id/domain",
-            json={"domain": "example.com"},
-            headers=auth_headers
-        )
-        assert response.status_code == 201
-        data = response.json()
-        assert data["domain"] == "example.com"
-        assert data["verification_status"] == "pending"
-        assert "dns_records" in data
-
-    async def test_add_duplicate_domain(self, client: AsyncClient, auth_headers):
-        # First add
-        await client.post(
-            "/api/projects/test-project-id/domain",
-            json={"domain": "duplicate.com"},
-            headers=auth_headers
-        )
-
-        # Second add should fail
-        response = await client.post(
-            "/api/projects/test-project-id-2/domain",
-            json={"domain": "duplicate.com"},
-            headers=auth_headers
-        )
-        assert response.status_code == 400
-
-    async def test_internal_domain_check_verified(self, client: AsyncClient):
-        # Setup: Create verified domain
-        # ...
-
-        response = await client.get(
-            "/api/internal/domain/check",
-            params={"domain": "verified-example.com"}
-        )
-        assert response.status_code == 200
-        assert response.json()["valid"] is True
-
-    async def test_internal_domain_check_not_found(self, client: AsyncClient):
-        response = await client.get(
-            "/api/internal/domain/check",
-            params={"domain": "nonexistent.com"}
-        )
-        assert response.status_code == 404
-```
-
 ### Manual Testing Checklist
 
-- [ ] Add domain with valid format
-- [ ] Add domain with invalid format (should fail)
-- [ ] Add domain already used by another project (should fail)
-- [ ] View DNS instructions after adding domain
-- [ ] Copy DNS values using copy buttons
-- [ ] Trigger manual verification check
-- [ ] Verify domain after DNS records are set
-- [ ] Access published page via custom domain
-- [ ] Remove custom domain
-- [ ] Test SSL certificate provisioning (first request)
-- [ ] Test auto-refresh of verification status
+**Domain Addition:**
+- [ ] Add valid subdomain (www.example.com)
+- [ ] Add valid apex domain (example.com)
+- [ ] Reject invalid format (not-a-domain)
+- [ ] Reject IP address (192.168.1.1)
+- [ ] Reject zaoya.app subdomains
+- [ ] Reject localhost/local domains
+- [ ] Reject domain already used by another project (400)
+- [ ] Reject if project already has domain (409)
+
+**DNS Instructions:**
+- [ ] Shows both subdomain and apex options
+- [ ] Copy buttons work
+- [ ] Help text visible for ALIAS/A fallback
+
+**Verification:**
+- [ ] Manual verify button works
+- [ ] Shows attempt count
+- [ ] Marks as verified when TXT record found
+- [ ] Marks as failed after 7 days expiry
+- [ ] Auto-verification job runs every 5 minutes
+
+**SSL & Access:**
+- [ ] First request triggers SSL provisioning
+- [ ] Published page accessible via custom domain
+- [ ] www.example.com redirects to example.com (if apex configured)
+- [ ] Correct canonical URL in HTML
+
+**Security:**
+- [ ] /api/internal/domain/check rejects without X-Zaoya-Edge-Secret
+- [ ] X-Custom-Domain header ignored without valid secret
+- [ ] Rate limiting on internal endpoint
 
 ---
 
 ## Implementation Tasks
 
+### Phase 0: Pre-requisites
+
+- [ ] Generate and configure `ZAOYA_EDGE_SECRET` env var
+- [ ] Document ECS public IP for DNS setup
+
 ### Phase 1: Backend Foundation (Day 1-2)
 
-- [ ] Create database migration for `custom_domains` table
+- [ ] Create Alembic migration for `custom_domains` table (with all fields)
+- [ ] Create Alembic migration for `audit_events` table
 - [ ] Create `CustomDomain` SQLAlchemy model
 - [ ] Update `Project` model with relationship
 - [ ] Create `DomainService` with validation and DNS lookup
+- [ ] Create `AccessControlService` (centralized permissions)
+- [ ] Create `AuditService` for logging
 - [ ] Install `dnspython` dependency
 
 ### Phase 2: API Endpoints (Day 2-3)
@@ -1098,21 +1330,23 @@ class TestDomainAPI:
 - [ ] GET /api/projects/{id}/domain - Get domain
 - [ ] POST /api/projects/{id}/domain/verify - Verify domain
 - [ ] DELETE /api/projects/{id}/domain - Remove domain
-- [ ] GET /api/internal/domain/check - Internal check for Caddy
-- [ ] Add request/response schemas (Pydantic)
+- [ ] GET /api/internal/domain/check - Internal check (secured)
+- [ ] POST /api/internal/domain/{domain}/ssl-active - SSL callback
+- [ ] Add Pydantic schemas
 
 ### Phase 3: Middleware & Routing (Day 3)
 
-- [ ] Create `CustomDomainMiddleware`
+- [ ] Create `CustomDomainMiddleware` (with secret validation)
 - [ ] Register middleware in FastAPI app
 - [ ] Update page serving to handle custom domains
-- [ ] Test page serving with mock custom domain header
+- [ ] Add www→apex redirect for apex domains
+- [ ] Update canonical URL generation
 
 ### Phase 4: Frontend UI (Day 4-5)
 
 - [ ] Create `DomainSettings` component
 - [ ] Create `DomainForm` component
-- [ ] Create `DnsInstructions` component with copy buttons
+- [ ] Create `DnsInstructions` component (both options)
 - [ ] Create `DomainStatus` badge component
 - [ ] Add domain settings to project settings page
 - [ ] Add auto-refresh for pending verification
@@ -1120,49 +1354,57 @@ class TestDomainAPI:
 ### Phase 5: Infrastructure (Day 5-6)
 
 - [ ] Set up Aliyun ECS instance
-- [ ] Install and configure Caddy
+- [ ] Install and configure Caddy with edge secret
 - [ ] Configure security group rules
 - [ ] Point pages.zaoya.app to ECS IP
 - [ ] Test SSL provisioning with test domain
+- [ ] Add ECS IP to backend allowlist (optional)
 
 ### Phase 6: Background Jobs (Day 6)
 
-- [ ] Create domain verification job
+- [ ] Create domain verification job with expiry handling
 - [ ] Set up APScheduler
 - [ ] Configure job to run every 5 minutes
-- [ ] Add email notification on verification success (optional)
+- [ ] Add audit logging
 
 ### Phase 7: Testing & Polish (Day 7)
 
 - [ ] Write unit tests for DomainService
 - [ ] Write integration tests for API endpoints
 - [ ] Manual end-to-end testing
-- [ ] Error handling improvements
+- [ ] Security testing (header spoofing, endpoint access)
 - [ ] Documentation updates
 
 ---
 
-## Security Considerations
+## Environment Variables
 
-1. **Domain Ownership Verification**: TXT record verification ensures only domain owners can connect domains
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `ZAOYA_EDGE_SECRET` | Yes | Shared secret for edge↔backend auth |
+| `ALLOWED_EDGE_IPS` | No | Comma-separated list of edge server IPs |
+| `EDGE_SERVER_IP` | Yes | Public IP of Caddy ECS (for DNS instructions) |
 
-2. **Rate Limiting**: Caddy's on-demand TLS is rate-limited to prevent certificate exhaustion attacks
+---
 
-3. **Internal Endpoint Protection**: `/api/internal/domain/check` should be restricted to Caddy server IP or use a shared secret
+## Security Checklist
 
-4. **Input Validation**: Domain format is strictly validated to prevent injection attacks
-
-5. **No Wildcard Support**: Only exact domain matches are allowed to prevent subdomain takeover
+- [ ] `ZAOYA_EDGE_SECRET` is cryptographically random (32+ bytes)
+- [ ] Secret is stored securely (env var, not in code)
+- [ ] `/api/internal/*` endpoints verify secret
+- [ ] `X-Custom-Domain` header only trusted with valid secret
+- [ ] Domain input is normalized and validated
+- [ ] Rate limiting on internal domain check endpoint
+- [ ] Audit logging for domain operations
+- [ ] No sensitive data in error responses
 
 ---
 
 ## Rollback Plan
 
-If issues occur after deployment:
-
-1. **Caddy Issues**: SSH to ECS, `systemctl stop caddy`, traffic will fail over
-2. **Backend Issues**: Remove CustomDomainMiddleware registration to disable feature
-3. **Database Issues**: Migration is additive (new table), no rollback needed unless dropping
+1. **Caddy Issues**: SSH to ECS, `systemctl stop caddy`
+2. **Backend Issues**: Remove `CustomDomainMiddleware` from app
+3. **Database Issues**: Migration is additive; drop `custom_domains` table if needed
 
 ---
 
@@ -1174,14 +1416,16 @@ If issues occur after deployment:
 | SSL provisioning time | < 30 seconds |
 | Custom domain page load time | < 2 seconds |
 | User setup completion rate | > 80% |
+| Security incidents | 0 |
 
 ---
 
 ## Future Enhancements (v2+)
 
 - Multiple domains per project
-- www/non-www redirect configuration
+- Per-user www/non-www redirect configuration
+- Punycode/IDN domain support
 - Subdomain wildcards
 - Custom SSL certificate upload
 - Domain analytics (traffic, geographic data)
-- Automatic www redirect setup
+- Shared Caddy certificate storage for HA
