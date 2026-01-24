@@ -1,7 +1,7 @@
-import { useState } from 'react'
 import { Panel, PanelContent } from '@/components/layout'
-import { MessageList, type Message } from './MessageList'
+import { MessageList } from './MessageList'
 import { InputBar } from './InputBar'
+import { useChatStore } from '@/stores'
 import { cn } from '@/lib/utils'
 
 interface ChatPanelProps {
@@ -9,24 +9,19 @@ interface ChatPanelProps {
 }
 
 export function ChatPanel({ className }: ChatPanelProps) {
-  const [messages, setMessages] = useState<Message[]>([])
+  const { messages, isLoading, addMessage } = useChatStore()
 
   const handleSend = (content: string) => {
-    const userMessage: Message = {
-      id: `user-${Date.now()}`,
-      role: 'user',
-      content,
-    }
-    setMessages((prev) => [...prev, userMessage])
+    addMessage({ role: 'user', content })
 
     // Simulate AI response (replace with real API later)
+    useChatStore.getState().setLoading(true)
     setTimeout(() => {
-      const aiMessage: Message = {
-        id: `ai-${Date.now()}`,
+      addMessage({
         role: 'assistant',
         content: `I'll help you create that. Let me ask a few questions to understand what you need...`,
-      }
-      setMessages((prev) => [...prev, aiMessage])
+      })
+      useChatStore.getState().setLoading(false)
     }, 500)
   }
 
@@ -34,7 +29,7 @@ export function ChatPanel({ className }: ChatPanelProps) {
     <Panel className={cn('w-80 border-r', className)}>
       <PanelContent className="flex flex-col">
         <MessageList messages={messages} className="flex-1" />
-        <InputBar onSend={handleSend} />
+        <InputBar onSend={handleSend} disabled={isLoading} />
       </PanelContent>
     </Panel>
   )

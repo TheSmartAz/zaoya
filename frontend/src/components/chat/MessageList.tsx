@@ -1,14 +1,9 @@
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { cn } from '@/lib/utils'
-
-export interface Message {
-  id: string
-  role: 'user' | 'assistant'
-  content: string
-}
+import type { ChatMessage } from '@/types/chat'
 
 interface MessageListProps {
-  messages: Message[]
+  messages: ChatMessage[]
   className?: string
 }
 
@@ -19,7 +14,9 @@ export function MessageList({ messages, className }: MessageListProps) {
         {messages.length === 0 ? (
           <div className="text-center text-muted-foreground py-12">
             <p className="text-lg font-medium">What do you want to create?</p>
-            <p className="text-sm mt-1">Describe your page and I'll build it for you.</p>
+            <p className="text-sm mt-1">
+              Describe your page and I'll build it for you.
+            </p>
           </div>
         ) : (
           messages.map((message) => (
@@ -46,3 +43,5 @@ export function MessageList({ messages, className }: MessageListProps) {
     </ScrollArea>
   )
 }
+
+export type { ChatMessage }

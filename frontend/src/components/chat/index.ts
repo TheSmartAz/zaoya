@@ -1,3 +1,3 @@
 export { ChatPanel } from './ChatPanel'
-export { MessageList, type Message } from './MessageList'
+export { MessageList, type ChatMessage } from './MessageList'
 export { InputBar } from './InputBar'
