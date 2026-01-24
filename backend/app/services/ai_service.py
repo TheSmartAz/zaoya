@@ -182,3 +182,26 @@ def get_available_models() -> list[dict]:
         {"id": "kimi", "name": "Kimi K2", "provider": "月之暗面"},
         {"id": "minimax", "name": "MiniMax M2.1", "provider": "MiniMax"}
     ]
+
+
+def is_model_available(model_id: Optional[str]) -> bool:
+    if not model_id:
+        return False
+    config = MODEL_CONFIGS.get(model_id)
+    if not config:
+        return False
+    return bool(config.get("key"))
+
+
+def resolve_available_model(preferred: Optional[str]) -> str:
+    if preferred in MODEL_CONFIGS and is_model_available(preferred):
+        return preferred
+
+    for model_id, config in MODEL_CONFIGS.items():
+        if config.get("key"):
+            return model_id
+
+    if preferred in MODEL_CONFIGS:
+        return preferred
+
+    return DEFAULT_MODEL

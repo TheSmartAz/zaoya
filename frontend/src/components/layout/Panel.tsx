@@ -7,7 +7,7 @@ interface PanelProps {
 
 export function Panel({ children, className }: PanelProps) {
   return (
-    <div className={cn('flex flex-col h-full', className)}>
+    <div className={cn('flex flex-col h-full min-w-0 overflow-hidden', className)}>
       {children}
     </div>
   )

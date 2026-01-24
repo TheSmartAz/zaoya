@@ -38,10 +38,12 @@ async def restrict_pages_host(request, call_next):
     path = request.url.path
 
     if pages_host and host == pages_host:
+        allow_api = settings.environment == "development" and path.startswith("/api/")
         if not (
             path.startswith("/p/")
             or path == "/zaoya-runtime.js"
             or path.startswith("/static/zaoya-runtime.js")
+            or allow_api
         ):
             return Response(status_code=404)
 

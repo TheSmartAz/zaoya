@@ -3,6 +3,9 @@
 from fastapi import APIRouter
 from pydantic import BaseModel
 from typing import Optional, List, Dict
+
+from app.models.schemas.interview import InterviewTurnRequest, InterviewTurnResponse
+from app.services.interview_orchestrator import create_initial_state, orchestrate_turn
 from ..services.ai_service import generate_response
 
 router = APIRouter(prefix="/api", tags=["interview"])
@@ -121,3 +124,22 @@ def _parse_questions(text: str) -> List[InterviewQuestion]:
         )
 
     return questions
+
+
+@router.post("/interview/v2", response_model=InterviewTurnResponse)
+async def interview_turn(request: InterviewTurnRequest) -> InterviewTurnResponse:
+    state = request.state
+    if request.action == "start" or state is None:
+        state = create_initial_state(
+            template=request.template,
+            template_inputs=request.templateInputs,
+            user_message=request.userMessage,
+        )
+
+    orchestrator = await orchestrate_turn(
+        state=state,
+        action=request.action,
+        answers=request.answers,
+        user_message=request.userMessage,
+    )
+    return InterviewTurnResponse(state=state, orchestrator=orchestrator)
