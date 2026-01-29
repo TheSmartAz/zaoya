@@ -20,6 +20,7 @@ class Snapshot(Base):
     summary: Mapped[str | None] = mapped_column(TEXT)
     design_system: Mapped[dict] = mapped_column(JSONB, default=dict)
     navigation: Mapped[dict] = mapped_column(JSONB, default=dict)
+    interview_state: Mapped[dict] = mapped_column(JSONB, default=dict)
     is_draft: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
 

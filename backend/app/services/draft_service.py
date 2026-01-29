@@ -46,6 +46,7 @@ class DraftService:
             is_draft=True,
             design_system={},
             navigation={},
+            interview_state={},
         )
         self.db.add(draft)
         await self.db.commit()

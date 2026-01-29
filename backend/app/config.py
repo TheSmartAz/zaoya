@@ -54,6 +54,25 @@ class Settings(BaseSettings):
     # Published Pages URL
     pages_url: str = "http://localhost:8000"  # Base URL for published pages
 
+    # API Base URL (for published runtime + storage links)
+    api_url: str = "http://localhost:8000"
+
+    # Storage (local or S3-compatible)
+    storage_backend: Optional[str] = "local"  # local | s3
+    uploads_dir: Optional[str] = None
+    storage_public_base_url: Optional[str] = None
+    storage_bucket: Optional[str] = None
+    storage_region: Optional[str] = None
+    storage_endpoint: Optional[str] = None
+    storage_access_key_id: Optional[str] = None
+    storage_secret_access_key: Optional[str] = None
+
+    # Edge / custom domain verification
+    domain_verification_interval_seconds: int = 300
+    edge_server_ip: Optional[str] = None
+    allowed_edge_ips: List[str] = []
+    zaoya_edge_secret: Optional[str] = None
+
     @field_validator("cors_origins", mode="before")
     @classmethod
     def parse_cors_origins(cls, v):

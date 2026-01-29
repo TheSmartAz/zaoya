@@ -6,6 +6,7 @@ from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from copy import deepcopy
 
+from app.db import AsyncSessionLocal
 from app.models.db import Project, Snapshot, Page
 from app.models.schemas import CreateSnapshotRequest
 
@@ -181,3 +182,40 @@ class SnapshotService:
         await self.db.commit()
         await self.db.refresh(new_draft)
         return new_draft
+
+
+class _SnapshotServiceFacade:
+    """Facade for build runtime tooling (manages DB session internally)."""
+
+    async def _get_project_user(self, db: AsyncSession, project_id: UUID) -> UUID:
+        result = await db.execute(select(Project).where(Project.id == project_id))
+        project = result.scalar_one_or_none()
+        if not project:
+            raise ValueError("Project not found")
+        return project.user_id
+
+    async def create(self, project_id: str, reason: str, metadata: dict | None = None) -> str:
+        from uuid import UUID as UUIDType
+
+        async with AsyncSessionLocal() as db:
+            project_uuid = UUIDType(project_id)
+            user_id = await self._get_project_user(db, project_uuid)
+            service = SnapshotService(db)
+            request = CreateSnapshotRequest(summary=reason)
+            snapshot = await service.create_snapshot(project_uuid, user_id, request)
+            return str(snapshot.id)
+
+    async def restore(self, snapshot_id: str, project_id: str) -> bool:
+        from uuid import UUID as UUIDType
+
+        async with AsyncSessionLocal() as db:
+            project_uuid = UUIDType(project_id)
+            user_id = await self._get_project_user(db, project_uuid)
+            service = SnapshotService(db)
+            await service.restore_snapshot(project_uuid, user_id, UUIDType(snapshot_id))
+            return True
+
+
+def get_snapshot_service() -> _SnapshotServiceFacade:
+    """Return a snapshot service facade for internal tooling."""
+    return _SnapshotServiceFacade()

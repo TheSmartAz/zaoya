@@ -12,7 +12,7 @@ Rules for HTML generation:
 4. Full HTML document structure (html, head, body)
 5. Clean, modern aesthetic with good whitespace
 6. Limited interactivity - forms should use Zaoya.submitForm()
-7. No external JavaScript except CDN links to Tailwind
+7. Do not include external scripts or stylesheets (no CDN links). Do not include <script> tags; Zaoya injects runtime and Tailwind CSS.
 
 Available runtime functions:
 - Zaoya.submitForm(formData): Submit form data

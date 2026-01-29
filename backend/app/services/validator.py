@@ -2,7 +2,7 @@
 
 import re
 import bleach
-from typing import Tuple, List
+from typing import Tuple, List, Optional
 
 # Allowed HTML tags (conservative set)
 ALLOWED_TAGS = [
@@ -57,6 +57,276 @@ ALLOWED_JS_CALLS = [
     'console.error',
 ]
 
+_HTML_RULES = [
+    {
+        "rule_id": "csp-no-tailwind-cdn",
+        "pattern": r"cdn\\.tailwindcss\\.com",
+        "category": "csp",
+        "message": "External Tailwind CDN not allowed",
+        "suggested_fix": "Inline Tailwind styles using the built-in compiler.",
+        "severity": "critical",
+        "flags": re.IGNORECASE,
+    },
+    {
+        "rule_id": "html-no-script-tag",
+        "pattern": r"<script[^>]*>",
+        "category": "js-security",
+        "message": "Script tag detected",
+        "suggested_fix": "Remove script tags and use Zaoya runtime helpers instead.",
+        "severity": "critical",
+        "flags": re.IGNORECASE,
+    },
+    {
+        "rule_id": "html-no-iframe",
+        "pattern": r"<iframe",
+        "category": "html-whitelist",
+        "message": "Iframe tag detected",
+        "suggested_fix": "Remove iframe elements from the page.",
+        "severity": "critical",
+        "flags": re.IGNORECASE,
+    },
+    {
+        "rule_id": "html-no-object",
+        "pattern": r"<object",
+        "category": "html-whitelist",
+        "message": "Object tag detected",
+        "suggested_fix": "Remove object/embed elements from the page.",
+        "severity": "critical",
+        "flags": re.IGNORECASE,
+    },
+    {
+        "rule_id": "html-no-embed",
+        "pattern": r"<embed",
+        "category": "html-whitelist",
+        "message": "Embed tag detected",
+        "suggested_fix": "Remove object/embed elements from the page.",
+        "severity": "critical",
+        "flags": re.IGNORECASE,
+    },
+    {
+        "rule_id": "html-no-javascript-protocol",
+        "pattern": r"javascript:",
+        "category": "js-security",
+        "message": "javascript: protocol detected",
+        "suggested_fix": "Replace javascript: URLs with safe event handlers.",
+        "severity": "critical",
+        "flags": re.IGNORECASE,
+    },
+    {
+        "rule_id": "html-no-inline-event",
+        "pattern": r"\\son\\w+\\s*=",
+        "category": "js-security",
+        "message": "Inline event handler detected",
+        "suggested_fix": "Remove inline event handlers and use approved JS helpers.",
+        "severity": "critical",
+        "flags": re.IGNORECASE,
+    },
+]
+
+_JS_RULES = [
+    {
+        "rule_id": "js-no-eval",
+        "pattern": r"eva\\w*l\\s*\\(",
+        "category": "js-security",
+        "message": "Code execution not allowed",
+        "suggested_fix": "Remove eval usage and use safe helpers.",
+        "severity": "critical",
+    },
+    {
+        "rule_id": "js-no-function-constructor",
+        "pattern": r"Function\\s*\\(",
+        "category": "js-security",
+        "message": "Function constructor not allowed",
+        "suggested_fix": "Remove Function constructor usage.",
+        "severity": "critical",
+    },
+    {
+        "rule_id": "js-no-fetch",
+        "pattern": r"fetch\\s*\\(",
+        "category": "js-security",
+        "message": "Network requests not allowed",
+        "suggested_fix": "Avoid fetch calls; use Zaoya.submitForm/track.",
+        "severity": "critical",
+    },
+    {
+        "rule_id": "js-no-xhr",
+        "pattern": r"XMLHttpRequest",
+        "category": "js-security",
+        "message": "Network requests not allowed",
+        "suggested_fix": "Avoid XMLHttpRequest; use Zaoya.submitForm/track.",
+        "severity": "critical",
+    },
+    {
+        "rule_id": "js-no-websocket",
+        "pattern": r"WebSocket",
+        "category": "js-security",
+        "message": "WebSockets not allowed",
+        "suggested_fix": "Remove WebSocket usage.",
+        "severity": "critical",
+    },
+    {
+        "rule_id": "js-no-localstorage",
+        "pattern": r"localStorage",
+        "category": "js-security",
+        "message": "Local storage not allowed",
+        "suggested_fix": "Remove localStorage usage.",
+        "severity": "critical",
+    },
+    {
+        "rule_id": "js-no-sessionstorage",
+        "pattern": r"sessionStorage",
+        "category": "js-security",
+        "message": "Session storage not allowed",
+        "suggested_fix": "Remove sessionStorage usage.",
+        "severity": "critical",
+    },
+    {
+        "rule_id": "js-no-cookie",
+        "pattern": r"document\\.cookie",
+        "category": "js-security",
+        "message": "Cookie access not allowed",
+        "suggested_fix": "Remove document.cookie access.",
+        "severity": "critical",
+    },
+    {
+        "rule_id": "js-no-frame-access",
+        "pattern": r"window\\.(top|parent|opener)",
+        "category": "js-security",
+        "message": "Frame access not allowed",
+        "suggested_fix": "Remove window.top/parent/opener usage.",
+        "severity": "critical",
+    },
+    {
+        "rule_id": "js-no-string-timeout",
+        "pattern": r"setTimeout\\s*\\(\\s*[\"\\']",
+        "category": "js-security",
+        "message": "String-based setTimeout not allowed",
+        "suggested_fix": "Use function callbacks instead of string-based timers.",
+        "severity": "critical",
+    },
+    {
+        "rule_id": "js-no-string-interval",
+        "pattern": r"setInterval\\s*\\(\\s*[\"\\']",
+        "category": "js-security",
+        "message": "String-based setInterval not allowed",
+        "suggested_fix": "Use function callbacks instead of string-based timers.",
+        "severity": "critical",
+    },
+]
+
+
+def _line_excerpt(text: str, match: re.Match) -> tuple[Optional[int], str]:
+    start = match.start()
+    line = text.count("\\n", 0, start) + 1
+    line_start = text.rfind("\\n", 0, start) + 1
+    line_end = text.find("\\n", match.end())
+    if line_end == -1:
+        line_end = len(text)
+    excerpt = text[line_start:line_end].strip()
+    if len(excerpt) > 200:
+        excerpt = excerpt[:197] + "..."
+    return line, excerpt
+
+
+def _build_error_detail(
+    *,
+    rule_id: str,
+    category: str,
+    message: str,
+    suggested_fix: str,
+    severity: str,
+    path: Optional[str],
+    line: Optional[int],
+    excerpt: str,
+) -> dict:
+    return {
+        "ruleId": rule_id,
+        "ruleCategory": category,
+        "path": path or "",
+        "line": line,
+        "excerpt": excerpt,
+        "message": message,
+        "suggestedFix": suggested_fix,
+        "severity": severity,
+    }
+
+
+def _scan_html_errors(html: str, path: Optional[str] = None) -> List[dict]:
+    details: List[dict] = []
+    for rule in _HTML_RULES:
+        pattern = rule["pattern"]
+        flags = rule.get("flags", 0)
+        match = re.search(pattern, html, flags)
+        if not match:
+            continue
+        line, excerpt = _line_excerpt(html, match)
+        details.append(
+            _build_error_detail(
+                rule_id=rule["rule_id"],
+                category=rule["category"],
+                message=rule["message"],
+                suggested_fix=rule["suggested_fix"],
+                severity=rule["severity"],
+                path=path,
+                line=line,
+                excerpt=excerpt,
+            )
+        )
+    return details
+
+
+def _scan_js_errors(code: str, path: Optional[str] = None) -> List[dict]:
+    details: List[dict] = []
+    seen_rules: set[str] = set()
+
+    for rule in _JS_RULES:
+        match = re.search(rule["pattern"], code)
+        if not match:
+            continue
+        if rule["rule_id"] in seen_rules:
+            continue
+        line, excerpt = _line_excerpt(code, match)
+        details.append(
+            _build_error_detail(
+                rule_id=rule["rule_id"],
+                category=rule["category"],
+                message=rule["message"],
+                suggested_fix=rule["suggested_fix"],
+                severity=rule["severity"],
+                path=path,
+                line=line,
+                excerpt=excerpt,
+            )
+        )
+        seen_rules.add(rule["rule_id"])
+
+    blocked_globals = ['fetch', 'XMLHttpRequest', 'WebSocket', 'localStorage', 'sessionStorage']
+    for global_name in blocked_globals:
+        pattern = r'\\b' + re.escape(global_name) + r'\\b'
+        if not re.search(pattern, code):
+            continue
+        rule_id = f'js-no-{global_name.lower()}'
+        if rule_id in seen_rules:
+            continue
+        match = re.search(pattern, code)
+        if not match:
+            continue
+        line, excerpt = _line_excerpt(code, match)
+        details.append(
+            _build_error_detail(
+                rule_id=rule_id,
+                category="js-security",
+                message=f'{global_name} is not allowed',
+                suggested_fix=f'Remove {global_name} usage.',
+                severity="critical",
+                path=path,
+                line=line,
+                excerpt=excerpt,
+            )
+        )
+        seen_rules.add(rule_id)
+
+    return details
 
 def sanitize_html(html: str) -> str:
     """Sanitize HTML using bleach.
@@ -109,6 +379,30 @@ def validate_js(code: str) -> Tuple[bool, List[str]]:
     return (len(errors) == 0, errors)
 
 
+def validate_js_with_details(code: str, path: Optional[str] = None) -> Tuple[bool, List[str], List[dict]]:
+    details = _scan_js_errors(code, path)
+    errors = [detail.get("message", "") for detail in details]
+    return (len(errors) == 0, errors, details)
+
+def validate_html(html: str, path: Optional[str] = None) -> dict:
+    """Validate HTML for dangerous content and return normalized output."""
+    warnings: List[str] = []
+    error_details = _scan_html_errors(html, path)
+    errors = [detail.get("message", "") for detail in error_details]
+
+    body_html = extract_body_content(html)
+    sanitized = sanitize_html(body_html)
+    normalized = normalize_html(sanitized)
+
+    return {
+        "ok": len(errors) == 0,
+        "errors": errors,
+        "warnings": warnings,
+        "normalized_html": normalized,
+        "error_details": error_details,
+    }
+
+
 def check_for_dangerous_content(html: str) -> List[str]:
     """Check HTML for obviously dangerous content.
 
@@ -118,33 +412,7 @@ def check_for_dangerous_content(html: str) -> List[str]:
     Returns:
         List of danger descriptions found
     """
-    dangers = []
-
-    # Allow Tailwind CDN script tag only
-    script_tags = re.findall(r'<script[^>]*>', html, re.IGNORECASE)
-    for tag in script_tags:
-        src_match = re.search(r'src=[\"\\\']([^\"\\\']+)', tag, re.IGNORECASE)
-        if not src_match:
-            dangers.append('Script tag detected')
-            break
-        src = src_match.group(1)
-        if src != 'https://cdn.tailwindcss.com':
-            dangers.append('Script tag detected')
-            break
-
-    dangerous_patterns = [
-        (r'<iframe', 'Iframe tag detected'),
-        (r'<object', 'Object tag detected'),
-        (r'<embed', 'Embed tag detected'),
-        (r'javascript:', 'javascript: protocol detected'),
-        (r'\\son\\w+\\s*=', 'Inline event handler detected'),
-    ]
-
-    for pattern, message in dangerous_patterns:
-        if re.search(pattern, html, re.IGNORECASE):
-            dangers.append(message)
-
-    return dangers
+    return [detail.get("message", "") for detail in _scan_html_errors(html)]
 
 
 def normalize_html(html: str) -> str:
@@ -168,23 +436,12 @@ def normalize_html(html: str) -> str:
                 flags=re.IGNORECASE
             )
 
-        # Ensure Tailwind CDN
-        if 'tailwindcss' not in html:
-            html = re.sub(
-                r'(<head[^>]*>)',
-                r'\1\n    <script src="https://cdn.tailwindcss.com"></script>',
-                html,
-                count=1,
-                flags=re.IGNORECASE
-            )
-
         return html
 
     # Wrap partial HTML in a document
     wrapped = '<!DOCTYPE html>\n<html lang="en">\n<head>\n'
     wrapped += '    <meta charset="UTF-8">\n'
     wrapped += '    <meta name="viewport" content="width=device-width, initial-scale=1.0">\n'
-    wrapped += '    <script src="https://cdn.tailwindcss.com"></script>\n'
     wrapped += '    <title>Zaoya Page</title>\n'
     wrapped += '</head>\n<body>\n'
     wrapped += html
@@ -205,23 +462,14 @@ def process_generation(html: str, js: str = None) -> Tuple[bool, str, str, List[
     """
     errors = []
 
-    # Check for dangerous content
-    dangers = check_for_dangerous_content(html)
-    if dangers:
-        errors.extend(dangers)
+    html_result = validate_html(html)
+    errors.extend(html_result.get("errors", []))
+    normalized = html_result.get("normalized_html") or ""
 
-    # Sanitize HTML (strip head/html wrappers if present)
-    body_html = extract_body_content(html)
-    sanitized = sanitize_html(body_html)
-
-    # Validate JS if present
     if js and js.strip():
         js_valid, js_errors = validate_js(js)
         if not js_valid:
             errors.extend(js_errors)
-
-    # Normalize HTML
-    normalized = normalize_html(sanitized)
 
     return (len(errors) == 0, normalized, js or '', errors)
 

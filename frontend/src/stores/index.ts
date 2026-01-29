@@ -1,2 +1,5 @@
 export { useChatStore } from './chatStore'
 export { useProjectStore } from './projectStore'
+export { useBuildStore } from './buildStore'
+export { useSettingsStore } from './settingsStore'
+export { useVersionStore } from './versionStore'

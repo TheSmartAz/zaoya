@@ -35,6 +35,10 @@ backend/.env.*
 .idea/
 .vscode/
 
+# Local tooling artifacts
+.logs/
+.playwright-mcp/
+
 # Build artifacts
 dist/
 build/

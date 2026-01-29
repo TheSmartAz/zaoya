@@ -45,6 +45,12 @@ from app.services.ai_service import (
     DEFAULT_MODEL,
     is_model_available,
 )
+from app.services.intent_detection import (
+    detect_intent,
+    DetectedIntent,
+    IntentCategory,
+    get_intent_suggested_questions,
+)
 
 
 TOPIC_LABELS = {
@@ -55,6 +61,7 @@ TOPIC_LABELS = {
     "design": "Design",
     "technical": "Technical",
     "constraints": "Constraints",
+    "intent": "Project details",
 }
 
 logger = logging.getLogger(__name__)
@@ -325,6 +332,46 @@ QUESTION_BANK: List[Dict[str, Any]] = [
     },
 ]
 
+INTENT_PRIORITY_SLOTS: Dict[str, List[str]] = {
+    IntentCategory.EVENT_INVITATION.value: [
+        "timing.date",
+        "timing.location",
+        "timing.time",
+        "timing.rsvp_deadline",
+        "goals.primary_goal",
+    ],
+    IntentCategory.LANDING_PAGE.value: [
+        "goals.primary_goal",
+        "goals.cta",
+        "audience.who",
+    ],
+    IntentCategory.PORTFOLIO.value: [
+        "scope.pages",
+        "content.sections",
+        "design.style",
+    ],
+    IntentCategory.CONTACT_FORM.value: [
+        "scope.features",
+        "technical.integrations",
+        "goals.primary_goal",
+    ],
+    IntentCategory.ECOMMERCE.value: [
+        "scope.features",
+        "content.sections",
+        "technical.integrations",
+    ],
+    IntentCategory.BLOG.value: [
+        "content.sections",
+        "audience.who",
+        "design.style",
+    ],
+    IntentCategory.DASHBOARD.value: [
+        "scope.features",
+        "technical.auth_required",
+        "technical.integrations",
+    ],
+}
+
 ORCHESTRATOR_SYSTEM_PROMPT = """
 You are an interview orchestrator for Zaoya, an AI website builder.
 
@@ -511,6 +558,84 @@ def _target_question_count(complexity: str) -> int:
     return 8
 
 
+def _parse_intent_category(value: Optional[str]) -> Optional[IntentCategory]:
+    if not value:
+        return None
+    try:
+        return IntentCategory(value)
+    except ValueError:
+        return None
+
+
+def _suggested_questions_for_state(state: InterviewState) -> Optional[List[str]]:
+    category = _parse_intent_category(state.detected_intent)
+    if not category:
+        return None
+    questions = get_intent_suggested_questions(category)
+    return questions or None
+
+
+def _apply_intent_fields(
+    brief: ProjectBrief,
+    inferred_fields: Dict[str, str],
+    allow_overwrite: bool = False,
+) -> None:
+    if not inferred_fields:
+        return
+    for slot, value in inferred_fields.items():
+        if value in (None, ""):
+            continue
+        current = _get_brief_value(brief, slot)
+        if not allow_overwrite and current not in (None, "", []):
+            continue
+        _set_brief_value(brief, slot, value)
+
+
+def _build_intent_question_defs(
+    brief: ProjectBrief,
+    suggested_questions: List[str],
+) -> List[Dict[str, Any]]:
+    if not suggested_questions:
+        return []
+    intent_questions: List[Dict[str, Any]] = []
+    seen_slots: set[str] = set()
+    for text in suggested_questions:
+        payload = {"id": text[:16], "text": text}
+        slot = _infer_slot(payload)
+        if not slot or slot in seen_slots:
+            continue
+        if not _is_valid_slot(brief, slot):
+            continue
+        if _get_brief_value(brief, slot) not in (None, "", []):
+            continue
+        question_type = "date" if slot == "timing.date" else "text"
+        intent_questions.append(
+            {
+                "topic": "intent",
+                "slot": slot,
+                "text": text,
+                "type": question_type,
+                "default_value": None,
+                "options": None,
+            }
+        )
+        seen_slots.add(slot)
+    return intent_questions
+
+
+def _prioritize_question_defs(
+    questions: List[Dict[str, Any]],
+    priority_slots: List[str],
+) -> List[Dict[str, Any]]:
+    if not priority_slots:
+        return questions
+    order = {slot: idx for idx, slot in enumerate(priority_slots)}
+    return sorted(
+        questions,
+        key=lambda item: order.get(item.get("slot"), len(order)),
+    )
+
+
 def _format_known_facts(brief: ProjectBrief) -> str:
     return json.dumps(brief.model_dump(), ensure_ascii=False, indent=2)
 
@@ -546,12 +671,16 @@ def _build_orchestrator_prompt(
     action: str,
 ) -> str:
     payload = _format_answers_for_prompt(state, user_message, answers)
+    suggested_questions = _suggested_questions_for_state(state) or []
     return f"""
 CURRENT_STATE:
 status: {state.status}
 complexity: {state.complexity}
+detected_intent: {state.detected_intent}
+intent_confidence: {state.confidence}
 current_group_index: {state.current_group_index}
 question_plan: {json.dumps([g.model_dump() for g in state.question_plan], ensure_ascii=False)}
+suggested_questions: {json.dumps(suggested_questions, ensure_ascii=False)}
 asked_count: {len(state.asked)}
 answers_count: {len(state.answers)}
 brief: {_format_known_facts(state.brief)}
@@ -587,9 +716,15 @@ def _build_question(option: Dict[str, Any]) -> Question:
     )
 
 
-def _resolve_interview_model() -> Optional[str]:
-    preferred = os.getenv("ZAOYA_INTERVIEW_MODEL", DEFAULT_MODEL)
-    model_id = resolve_available_model(preferred)
+def _resolve_interview_model(preferred: Optional[str] = None) -> Optional[str]:
+    if os.getenv("ZAOYA_INTERVIEW_MOCK") == "1":
+        return "mock"
+    interview_model = os.getenv("ZAOYA_INTERVIEW_MODEL")
+    if interview_model:
+        preferred_value = interview_model
+    else:
+        preferred_value = preferred or DEFAULT_MODEL
+    model_id = resolve_available_model(preferred_value)
     if not is_model_available(model_id):
         return None
     return model_id
@@ -691,14 +826,54 @@ def _is_nonempty_answer(answer: InterviewAnswerPayload) -> bool:
     return bool((answer.raw_text or "").strip())
 
 
-def generate_question_plan(brief: ProjectBrief, complexity: str) -> List[QuestionGroup]:
+def _generate_questions(
+    intent: DetectedIntent,
+    brief: ProjectBrief,
+    complexity: str,
+) -> List[QuestionGroup]:
+    """Generate question groups based on detected intent."""
+    return generate_question_plan(
+        brief,
+        complexity,
+        detected_intent=intent.category.value,
+        suggested_questions=intent.suggested_questions,
+    )
+
+
+def generate_question_plan(
+    brief: ProjectBrief,
+    complexity: str,
+    detected_intent: Optional[str] = None,
+    suggested_questions: Optional[List[str]] = None,
+) -> List[QuestionGroup]:
+    intent_questions: List[Dict[str, Any]] = []
+    intent_slots: set[str] = set()
+
+    intent_category = _parse_intent_category(detected_intent)
+    if intent_category and not suggested_questions:
+        suggested_questions = get_intent_suggested_questions(intent_category)
+
+    if suggested_questions:
+        intent_questions = _build_intent_question_defs(brief, suggested_questions)
+        intent_slots = {q["slot"] for q in intent_questions}
+
     missing_questions = []
     for option in QUESTION_BANK:
+        if option["slot"] in intent_slots:
+            continue
         if _get_brief_value(brief, option["slot"]) in (None, [], ""):
             missing_questions.append(option)
 
+    priority_slots = INTENT_PRIORITY_SLOTS.get(detected_intent or "", [])
+    missing_questions = _prioritize_question_defs(missing_questions, priority_slots)
+
     target = _target_question_count(complexity)
-    selected = missing_questions[:target]
+    selected: List[Dict[str, Any]] = []
+    if intent_questions:
+        selected.extend(intent_questions[:target])
+    remaining = max(target - len(selected), 0)
+    if remaining:
+        selected.extend(missing_questions[:remaining])
 
     grouped: Dict[str, List[Question]] = {}
     for option in selected:
@@ -763,12 +938,18 @@ SLOT_ALIASES = {
     "pages": "scope.pages",
     "cta": "goals.cta",
     "content_sections": "content.sections",
+    "copy": "content.assets.copy_text",
+    "copy_text": "content.assets.copy_text",
     "integrations": "technical.integrations",
     "constraints": "technical.constraints",
     "rsvp_method": "scope.features",
     "rsvp_fields": "scope.features",
     "hero_image_source": "content.assets.images",
     "hero_image": "content.assets.images",
+    "event_date": "timing.date",
+    "event_time": "timing.time",
+    "event_location": "timing.location",
+    "rsvp_deadline": "timing.rsvp_deadline",
 }
 
 
@@ -780,20 +961,50 @@ def _infer_slot(question: Dict[str, Any]) -> Optional[str]:
     text = str(question.get("text") or "").lower()
     if "audience" in text:
         return "audience.who"
+    if "value proposition" in text:
+        return "goals.primary_goal"
+    if "cta" in text or "call-to-action" in text:
+        return "goals.cta"
     if "goal" in text:
         return "goals.primary_goal"
+    if "name" in text or "brand" in text or "bio" in text:
+        return "content.assets.copy_text"
     if "style" in text or "vibe" in text or "mood" in text:
         return "design.style"
     if "feature" in text:
         return "scope.features"
+    if "project" in text or "workflow" in text:
+        return "scope.features"
     if "page" in text:
         return "scope.pages"
+    if "product" in text or "category" in text:
+        return "scope.features"
+    if "topic" in text:
+        return "content.sections"
     if "integration" in text:
         return "technical.integrations"
+    if "subscribe" in text or "newsletter" in text or "follow" in text:
+        return "technical.integrations"
+    if "role" in text or "permission" in text:
+        return "technical.constraints"
+    if "form" in text or "field" in text:
+        return "scope.features"
     if "constraint" in text or "requirement" in text:
         return "technical.constraints"
+    if "date" in text or "when" in text:
+        return "timing.date"
+    if "time" in text:
+        return "timing.time"
+    if "location" in text or "where" in text or "venue" in text:
+        return "timing.location"
+    if "deadline" in text:
+        return "timing.rsvp_deadline"
     if "rsvp" in text:
+        if "by" in text or "before" in text:
+            return "timing.rsvp_deadline"
         return "scope.features"
+    if "social" in text or "links" in text:
+        return "technical.integrations"
     if "photo" in text or "image" in text:
         return "content.assets.images"
     return None
@@ -929,13 +1140,7 @@ def _repair_orchestrator_payload(
                     }
                     next_action.pop("questions", None)
                 else:
-                    fallback_group = get_next_group(state)
-                    if not fallback_group and not state.question_plan:
-                        fallback_plan = generate_question_plan(state.brief, state.complexity)
-                        if fallback_plan:
-                            fallback_group = fallback_plan[0]
-                    if fallback_group:
-                        next_action["group"] = fallback_group.model_dump()
+                    return None
 
     if action_type == "ask_group" and isinstance(next_action.get("group"), dict):
         group_payload = next_action.get("group")
@@ -944,13 +1149,7 @@ def _repair_orchestrator_payload(
             if isinstance(questions, list):
                 normalized_questions = _normalize_question_payloads(questions, state.brief)
                 if normalized_questions is None:
-                    fallback_group = get_next_group(state)
-                    if not fallback_group and not state.question_plan:
-                        fallback_plan = generate_question_plan(state.brief, state.complexity)
-                        if fallback_plan:
-                            fallback_group = fallback_plan[0]
-                    if fallback_group:
-                        next_action["group"] = fallback_group.model_dump()
+                    return None
                 else:
                     group_payload["questions"] = normalized_questions
 
@@ -970,10 +1169,13 @@ async def _call_orchestrator_llm(
     user_message: Optional[str],
     answers: List[InterviewAnswerPayload],
     action: str,
+    model_id: Optional[str] = None,
 ) -> OrchestratorResponse:
-    model_id = _resolve_interview_model()
+    model_id = model_id or _resolve_interview_model()
     if not model_id:
         raise RuntimeError("No available model for interview orchestrator")
+    if model_id == "mock":
+        return _mock_orchestrator_response(state, user_message, action)
 
     prompt = _build_orchestrator_prompt(state, user_message, answers, action)
 
@@ -1017,7 +1219,10 @@ async def _call_orchestrator_llm(
                         {"model_id": model_id, "reason": "missing_plan_or_doc"},
                     )
                     return await finalize_interview(
-                        state, reason="llm_finish_missing_plan", final_status="done"
+                        state,
+                        reason="llm_finish_missing_plan",
+                        final_status="done",
+                        model_id=model_id,
                     )
             return OrchestratorResponse.model_validate_json(payload_text)
         except Exception as exc:  # noqa: BLE001 - retry on any parse or API error
@@ -1045,11 +1250,50 @@ async def _call_orchestrator_llm(
     raise RuntimeError(f"Failed to generate orchestrator response: {last_error}")
 
 
+def _mock_orchestrator_response(
+    state: InterviewState,
+    user_message: Optional[str],
+    action: str,
+) -> OrchestratorResponse:
+    """Deterministic mock response used in tests to avoid external LLM calls."""
+    question_text = "What's the primary goal for this experience?"
+    question = Question(
+        id=f"q_{uuid4().hex[:8]}",
+        text=question_text,
+        type="single_select",
+        options=[
+            QuestionOption(value="play", label="Play the game"),
+            QuestionOption(value="learn", label="Learn more"),
+            QuestionOption(value="other", label="Other"),
+        ],
+        allow_other=True,
+        slot="goals.primary_goal",
+        default_value=None,
+    )
+    group = QuestionGroup(
+        id=f"grp_{uuid4().hex[:8]}",
+        topic="intent",
+        topic_label=TOPIC_LABELS.get("intent", "Project details"),
+        questions=[question],
+        is_completed=False,
+    )
+    return OrchestratorResponse(
+        mode="interview",
+        agent_callouts=_build_agent_callouts(),
+        brief_patch={},
+        next_action=AskGroupAction(type="ask_group", group=group),
+        confidence=0.5,
+        reason_codes=[f"mock:{action}"],
+        user_sentiment="neutral",
+    )
+
+
 async def _generate_product_document(
     brief: ProjectBrief,
     plan: Optional[BuildPlan] = None,
+    model_id: Optional[str] = None,
 ) -> ProductDocument:
-    model_id = _resolve_interview_model()
+    model_id = model_id or _resolve_interview_model()
     if not model_id:
         raise RuntimeError("No available model for product document")
 
@@ -1100,6 +1344,16 @@ def _fallback_product_document(
         features=plan.features if plan and plan.features else brief.scope.features or brief.technical.integrations or [],
         requirements=brief.technical.constraints or [],
     )
+    timing = None
+    if brief.timing and any(
+        [brief.timing.date, brief.timing.time, brief.timing.location, brief.timing.rsvp_deadline]
+    ):
+        timing = ProductDocumentTiming(
+            date=brief.timing.date or "TBD",
+            time=brief.timing.time or "TBD",
+            duration=None,
+            location=brief.timing.location,
+        )
     if brief.questions_skipped > 0:
         content.requirements.append("Defaults applied for skipped questions")
     metadata = ProductDocumentMetadata(
@@ -1111,14 +1365,19 @@ def _fallback_product_document(
     return ProductDocument(
         project_type=brief.project_type or brief.scope.type or "project",
         overview=overview,
+        timing=timing,
         design=design,
         content=content,
         metadata=metadata,
     )
 
 
-async def _edit_build_plan(state: InterviewState, instruction: str) -> BuildPlan:
-    model_id = _resolve_interview_model()
+async def _edit_build_plan(
+    state: InterviewState,
+    instruction: str,
+    model_id: Optional[str] = None,
+) -> BuildPlan:
+    model_id = model_id or _resolve_interview_model()
     if not model_id:
         raise RuntimeError("No available model for build plan edit")
 
@@ -1215,6 +1474,81 @@ def _build_agent_callouts() -> List[AgentCallout]:
         AgentCallout(agent="TechAgent", content="Checking technical needs..."),
         AgentCallout(agent="PlannerAgent", content="Drafting a build plan..."),
     ]
+
+
+async def build_first_question_response(
+    state: InterviewState,
+    user_message: Optional[str] = None,
+    preferred_model: Optional[str] = None,
+) -> OrchestratorResponse:
+    """Create the first ask-group response using the orchestrator LLM."""
+    model_id = _resolve_interview_model(preferred_model)
+    use_ai = _should_use_ai() and model_id is not None
+
+    if not use_ai:
+        return await finalize_interview(
+            state,
+            reason="ai_unavailable",
+            final_status="done",
+            model_id=model_id,
+        )
+
+    orchestrator = await _call_orchestrator_llm(
+        state=state,
+        user_message=user_message,
+        answers=[],
+        action="start",
+        model_id=model_id,
+    )
+    orchestrator = _normalize_orchestrator_response(state, orchestrator)
+
+    orchestrator.brief_patch = _normalize_brief_patch(orchestrator.brief_patch)
+    state.brief = apply_brief_patch(state.brief, orchestrator.brief_patch)
+    if "complexity" in orchestrator.brief_patch:
+        complexity_value = orchestrator.brief_patch.get("complexity")
+        if complexity_value in ("low", "medium", "high"):
+            state.complexity = complexity_value
+            state.brief.complexity = complexity_value
+
+    if isinstance(orchestrator.next_action, AskGroupAction):
+        group = orchestrator.next_action.group
+        existing_ids = {g.id for g in state.question_plan}
+        if group.id in existing_ids:
+            for idx, existing in enumerate(state.question_plan):
+                if existing.id == group.id:
+                    group.is_completed = False
+                    state.question_plan[idx] = group
+                    break
+        else:
+            state.question_plan.append(group)
+        state.status = "in_progress"
+        for idx, existing in enumerate(state.question_plan):
+            if existing.id == group.id:
+                state.current_group_index = idx
+                break
+        record_asked_group(state, group)
+    elif isinstance(orchestrator.next_action, AskFollowupAction):
+        state.status = "in_progress"
+        followup_group = QuestionGroup(
+            id=f"followup_{uuid4().hex[:6]}",
+            topic="follow_up",
+            topic_label="Follow-up",
+            questions=orchestrator.next_action.questions,
+            is_completed=False,
+        )
+        state.question_plan.append(followup_group)
+        state.current_group_index = len(state.question_plan) - 1
+        record_asked_group(state, followup_group)
+    elif isinstance(orchestrator.next_action, FinishAction):
+        state.status = "done"
+        state.build_plan = orchestrator.next_action.plan
+        state.product_document = orchestrator.next_action.product_document
+    elif isinstance(orchestrator.next_action, HandleOfftopicAction):
+        state.status = "in_progress"
+    elif isinstance(orchestrator.next_action, SuggestEarlyFinishAction):
+        state.status = "in_progress"
+
+    return orchestrator
 
 
 def _ensure_question_options(question: Question) -> Question:
@@ -1334,6 +1668,53 @@ def _normalize_brief_patch(patch: Dict[str, Any]) -> Dict[str, Any]:
             content["assets"] = {"images": assets}
         normalized["content"] = content
 
+    scalar_paths = {
+        "project_type",
+        "language",
+        "scope.type",
+        "audience.who",
+        "audience.context",
+        "audience.size",
+        "goals.primary_goal",
+        "goals.success_criteria",
+        "goals.cta",
+        "timing.date",
+        "timing.time",
+        "timing.location",
+        "timing.rsvp_deadline",
+        "design.style",
+        "design.mood",
+        "content.assets.copy",
+        "content.assets.logo",
+    }
+
+    def _coerce_scalar(value: Any) -> Any:
+        if isinstance(value, list):
+            if not value:
+                return None
+            first = value[0]
+            return first if isinstance(first, str) else str(first)
+        return value
+
+    # Normalize dotted keys in patch
+    for key, value in list(normalized.items()):
+        if key in scalar_paths:
+            normalized[key] = _coerce_scalar(value)
+
+    # Normalize nested keys
+    for path in scalar_paths:
+        if "." not in path:
+            continue
+        current: Any = normalized
+        parts = path.split(".")
+        for part in parts[:-1]:
+            if not isinstance(current, dict) or part not in current:
+                current = None
+                break
+            current = current[part]
+        if isinstance(current, dict) and parts[-1] in current:
+            current[parts[-1]] = _coerce_scalar(current[parts[-1]])
+
     return normalized
 
 
@@ -1353,15 +1734,7 @@ def _normalize_orchestrator_response(
             state.brief,
         )
         if normalized_questions is None:
-            fallback_group = get_next_group(state)
-            if not fallback_group and not state.question_plan:
-                fallback_plan = generate_question_plan(state.brief, state.complexity)
-                if fallback_plan:
-                    fallback_group = fallback_plan[0]
-            if fallback_group:
-                next_action.group = fallback_group
-            else:
-                next_action.group.questions = _normalize_question_list(next_action.group.questions)
+            next_action.group.questions = _normalize_question_list(next_action.group.questions)
         else:
             group_payload["questions"] = normalized_questions
             next_action.group = QuestionGroup.model_validate(group_payload)
@@ -1392,15 +1765,61 @@ def _is_ready_to_finish(state: InterviewState) -> bool:
     return has_project_type and has_audience and has_goal and has_features_or_sections
 
 
+async def process_first_message(
+    project_id: Optional[str],
+    message: str,
+    template: Optional[Dict[str, str]] = None,
+    template_inputs: Optional[Dict[str, str]] = None,
+    language: str = "en",
+    auto_detect_language: bool = True,
+) -> InterviewState:
+    """Process user's first message - detect intent and start interview."""
+    description = message or " ".join((template_inputs or {}).values())
+    complexity = analyze_complexity(description)
+    detected_language = _detect_language(message or "") if auto_detect_language else None
+
+    intent = await detect_intent(message)
+
+    brief = ProjectBrief(
+        project_type=template.get("name") if template else None,
+        complexity=complexity,
+        language=detected_language or language,
+        created_at=_now_ts(),
+    )
+
+    if template_inputs:
+        for _, value in template_inputs.items():
+            if value and not brief.project_type:
+                brief.project_type = value
+        brief.scope.type = brief.scope.type or (template.get("name") if template else None)
+
+    _apply_intent_fields(brief, intent.inferred_fields, allow_overwrite=False)
+
+    return InterviewState(
+        project_id=project_id,
+        status="in_progress",
+        complexity=complexity,
+        detected_intent=intent.category.value,
+        confidence=intent.confidence,
+        question_plan=[],
+        current_group_index=0,
+        asked=[],
+        answers=[],
+        brief=brief,
+        build_plan=None,
+    )
+
+
 def create_initial_state(
     template: Optional[Dict[str, str]] = None,
     template_inputs: Optional[Dict[str, str]] = None,
     user_message: Optional[str] = None,
     language: str = "en",
+    auto_detect_language: bool = True,
 ) -> InterviewState:
     description = user_message or " ".join((template_inputs or {}).values())
     complexity = analyze_complexity(description)
-    detected_language = _detect_language(user_message or "")
+    detected_language = _detect_language(user_message or "") if auto_detect_language else None
 
     brief = ProjectBrief(
         project_type=template.get("name") if template else None,
@@ -1418,12 +1837,15 @@ def create_initial_state(
     return InterviewState(
         status="not_started",
         complexity=complexity,
+        project_id=None,
         question_plan=[],
         current_group_index=0,
         asked=[],
         answers=[],
         brief=brief,
         build_plan=None,
+        detected_intent=None,
+        confidence=None,
     )
 
 
@@ -1549,6 +1971,7 @@ async def finalize_interview(
     state: InterviewState,
     reason: str = "enough_info",
     final_status: InterviewStatus = "done",
+    model_id: Optional[str] = None,
 ) -> OrchestratorResponse:
     state.status = final_status
     if state.question_plan:
@@ -1560,7 +1983,11 @@ async def finalize_interview(
     summary = _summary_from_brief(state.brief)
 
     try:
-        product_document = await _generate_product_document(state.brief, build_plan)
+        product_document = await _generate_product_document(
+            state.brief,
+            build_plan,
+            model_id=model_id,
+        )
     except Exception:
         product_document = _fallback_product_document(state.brief, build_plan)
 
@@ -1587,8 +2014,10 @@ async def orchestrate_turn(
     action: str,
     answers: Optional[List[InterviewAnswerPayload]] = None,
     user_message: Optional[str] = None,
+    preferred_model: Optional[str] = None,
 ) -> OrchestratorResponse:
     answers = answers or []
+    model_id = _resolve_interview_model(preferred_model)
 
     # User wants to finish immediately
     if action in {"generate_now", "skip_all"}:
@@ -1604,7 +2033,12 @@ async def orchestrate_turn(
             state.brief.questions_skipped += remaining
             state.brief.questions_skipped = max(state.brief.questions_skipped, 0)
         final_status: InterviewStatus = "skipped" if action == "skip_all" else "done"
-        return await finalize_interview(state, reason="user_generate_now", final_status=final_status)
+        return await finalize_interview(
+            state,
+            reason="user_generate_now",
+            final_status=final_status,
+            model_id=model_id,
+        )
 
     # If interview already finished, treat messages as build plan edits
     if (
@@ -1614,14 +2048,22 @@ async def orchestrate_turn(
         and user_message
     ):
         updated_plan = state.build_plan
-        if _should_use_ai() and _resolve_interview_model() is not None:
+        if _should_use_ai() and model_id is not None:
             try:
-                updated_plan = await _edit_build_plan(state, user_message)
+                updated_plan = await _edit_build_plan(
+                    state,
+                    user_message,
+                    model_id=model_id,
+                )
             except Exception:
                 updated_plan = state.build_plan
         state.build_plan = updated_plan
         try:
-            state.product_document = await _generate_product_document(state.brief, state.build_plan)
+            state.product_document = await _generate_product_document(
+                state.brief,
+                state.build_plan,
+                model_id=model_id,
+            )
         except Exception:
             state.product_document = _fallback_product_document(state.brief, state.build_plan)
         return OrchestratorResponse(
@@ -1655,47 +2097,23 @@ async def orchestrate_turn(
     elif user_message:
         record_freeform_answer(state, user_message)
 
-    use_ai = _should_use_ai() and _resolve_interview_model() is not None
+    use_ai = _should_use_ai() and model_id is not None
 
     if use_ai:
-        orchestrator = await _call_orchestrator_llm(state, user_message, filtered_answers, action)
+        orchestrator = await _call_orchestrator_llm(
+            state,
+            user_message,
+            filtered_answers,
+            action,
+            model_id=model_id,
+        )
         orchestrator = _normalize_orchestrator_response(state, orchestrator)
     else:
-        # Deterministic fallback
-        if not state.question_plan:
-            state.question_plan = generate_question_plan(state.brief, state.complexity)
-        current_group = get_next_group(state)
-        if not current_group:
-            return await finalize_interview(state, reason="no_questions_left", final_status="done")
-        if action == "skip":
-            mark_group_completed(state, current_group.id)
-            next_group = get_next_group(state)
-            if not next_group:
-                return await finalize_interview(state, reason="skip_to_end", final_status="done")
-            return OrchestratorResponse(
-                mode="interview",
-                agent_callouts=_build_agent_callouts(),
-                brief_patch={},
-                next_action=AskGroupAction(type="ask_group", group=next_group),
-                confidence=0.5,
-                reason_codes=["skip_group"],
-                user_sentiment="impatient",
-            )
-        if answered_any:
-            mark_group_completed(state, current_group.id)
-        if _is_ready_to_finish(state):
-            return await finalize_interview(state, reason="enough_info", final_status="done")
-        next_group = get_next_group(state)
-        if not next_group:
-            return await finalize_interview(state, reason="no_questions_left", final_status="done")
-        return OrchestratorResponse(
-            mode="interview",
-            agent_callouts=_build_agent_callouts(),
-            brief_patch={},
-            next_action=AskGroupAction(type="ask_group", group=next_group),
-            confidence=0.6,
-            reason_codes=["next_group"],
-            user_sentiment="neutral",
+        return await finalize_interview(
+            state,
+            reason="ai_unavailable",
+            final_status="done",
+            model_id=model_id,
         )
 
     # Apply brief updates from LLM

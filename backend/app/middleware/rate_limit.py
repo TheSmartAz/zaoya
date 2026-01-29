@@ -1,6 +1,9 @@
 """Global rate limiting middleware."""
 
-from fastapi import Request, HTTPException
+import os
+
+from fastapi import Request
+from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from datetime import datetime, timedelta
 from collections import defaultdict
@@ -29,6 +32,9 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self.lock = asyncio.Lock()
 
     async def dispatch(self, request: Request, call_next):
+        if os.getenv("ZAOYA_DISABLE_RATE_LIMIT") == "1":
+            return await call_next(request)
+
         # Skip rate limiting for health checks
         if request.url.path in ["/", "/health", "/api/health"]:
             return await call_next(request)
@@ -52,9 +58,9 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
             # Check minute limit
             if len(self.minute_requests[client_ip]) >= self.requests_per_minute:
-                raise HTTPException(
+                return JSONResponse(
                     status_code=429,
-                    detail="Too many requests. Please try again later.",
+                    content={"detail": "Too many requests. Please try again later."},
                     headers={
                         "Retry-After": "60",
                         "X-RateLimit-Limit": str(self.requests_per_minute),
@@ -64,9 +70,9 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
             # Check hour limit
             if len(self.hour_requests[client_ip]) >= self.requests_per_hour:
-                raise HTTPException(
+                return JSONResponse(
                     status_code=429,
-                    detail="Rate limit exceeded. Try again later.",
+                    content={"detail": "Rate limit exceeded. Try again later."},
                     headers={
                         "Retry-After": "3600",
                         "X-RateLimit-Limit": str(self.requests_per_hour),

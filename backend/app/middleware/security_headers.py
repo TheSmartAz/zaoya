@@ -17,13 +17,15 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next):
         response = await call_next(request)
+        path = request.url.path
+        skip_frame = path.startswith("/p-sim/")
 
         # Prevent MIME type sniffing
         if "X-Content-Type-Options" not in response.headers:
             response.headers["X-Content-Type-Options"] = "nosniff"
 
         # Prevent clickjacking
-        if "X-Frame-Options" not in response.headers:
+        if "X-Frame-Options" not in response.headers and not skip_frame:
             response.headers["X-Frame-Options"] = "DENY"
 
         # Enable XSS filtering (browser feature)

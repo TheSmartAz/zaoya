@@ -7,7 +7,7 @@ from app.db.sync import sync_engine
 from app.db import Base
 
 # Import all models here for autogenerate support
-from app.models.db import User, Project, Snapshot, Page
+from app.models.db import User, Project, Snapshot, Page, BuildRun
 
 config = context.config
 fileConfig(config.config_file_name)

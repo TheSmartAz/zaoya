@@ -1,19 +1,27 @@
+import { NavLink } from 'react-router-dom'
 import { cn } from '@/lib/utils'
 import { Home, Settings, History, Layers } from 'lucide-react'
-import { Button } from '@/components/ui/button'
+import { buttonVariants } from '@/components/ui/button'
 
 interface SidebarProps {
   className?: string
 }
 
 const sidebarItems = [
-  { icon: Home, label: 'Home', href: '/' },
+  { icon: Home, label: 'Home', to: '/' },
   { icon: Layers, label: 'Pages', href: '#pages' },
   { icon: History, label: 'History', href: '#history' },
-  { icon: Settings, label: 'Settings', href: '#settings' },
+  { icon: Settings, label: 'Settings', to: '/settings' },
 ]
 
 export function Sidebar({ className }: SidebarProps) {
+  const itemClass = (isActive?: boolean) =>
+    cn(
+      buttonVariants({ variant: 'ghost', size: 'icon' }),
+      'h-10 w-10',
+      isActive && 'bg-accent text-accent-foreground'
+    )
+
   return (
     <aside
       className={cn(
@@ -22,15 +30,37 @@ export function Sidebar({ className }: SidebarProps) {
       )}
     >
       {sidebarItems.map((item) => (
-        <Button
-          key={item.label}
-          variant="ghost"
-          size="icon"
-          className="h-10 w-10"
-          title={item.label}
-        >
-          <item.icon className="h-5 w-5" />
-        </Button>
+        item.to ? (
+          <NavLink
+            key={item.label}
+            to={item.to}
+            className={({ isActive }) => itemClass(isActive)}
+            title={item.label}
+            aria-label={item.label}
+          >
+            <item.icon className="h-5 w-5" />
+          </NavLink>
+        ) : item.href ? (
+          <a
+            key={item.label}
+            href={item.href}
+            className={itemClass(false)}
+            title={item.label}
+            aria-label={item.label}
+          >
+            <item.icon className="h-5 w-5" />
+          </a>
+        ) : (
+          <button
+            key={item.label}
+            className={itemClass(false)}
+            title={item.label}
+            aria-label={item.label}
+            type="button"
+          >
+            <item.icon className="h-5 w-5" />
+          </button>
+        )
       ))}
     </aside>
   )

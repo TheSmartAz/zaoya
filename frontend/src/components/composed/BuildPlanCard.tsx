@@ -1,12 +1,14 @@
+import { Loader2 } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
-import type { BuildPlan } from '@/types/buildPlan'
+import type { BuildPlanSummary } from '@/types/buildPlanSummary'
 
 interface BuildPlanCardProps {
-  plan: BuildPlan
+  plan: BuildPlanSummary
   onGenerate: () => void
   onEdit: () => void
+  isGenerating?: boolean
   className?: string
 }
 
@@ -14,6 +16,7 @@ export function BuildPlanCard({
   plan,
   onGenerate,
   onEdit,
+  isGenerating = false,
   className,
 }: BuildPlanCardProps) {
   return (
@@ -53,8 +56,19 @@ export function BuildPlanCard({
           </p>
         </div>
 
-        <Button className="w-full mt-4" onClick={onGenerate}>
-          Generate Page →
+        <Button
+          className="w-full mt-4"
+          onClick={onGenerate}
+          disabled={isGenerating}
+        >
+          {isGenerating ? (
+            <span className="flex items-center justify-center gap-2">
+              <Loader2 className="h-4 w-4 animate-spin" />
+              Generating...
+            </span>
+          ) : (
+            'Generate Page →'
+          )}
         </Button>
       </CardContent>
     </Card>
